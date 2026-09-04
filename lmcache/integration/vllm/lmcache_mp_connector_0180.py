@@ -122,7 +122,7 @@ def create_scheduler_adapter(
         kwargs["tp_size"] = tp_size
 
     return LMCacheMPSchedulerAdapter(
-        server_url,
+        [server_url],
         zmq_context,
         vllm_config.model_config.model,
         world_size,
