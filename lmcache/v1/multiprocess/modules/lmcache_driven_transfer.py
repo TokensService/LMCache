@@ -700,6 +700,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # ops -- never across context creation, layout-registry calls, or
         # empty_cache (leaf-lock invariant: no thread holds two locks).
         self._lock = threading.Lock()
+        self._register_kv_cache_inflight = 0
 
         # Route finish_write / finish_read_prefetched through a C++ host
         # callback so the driver thread doesn't acquire the GIL.
@@ -842,6 +843,47 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             # Backends without IPC collection omit this optional operation.
             ipc_collect()
 
+    def is_work_doing_register_kv_cache(self) -> bool:
+        """Return True while any REGISTER_KV_CACHE handler is still running."""
+        with self._lock:
+            return self._register_kv_cache_inflight > 0
+
+    def _register_kv_cache_with_busy_state(
+        self,
+        instance_id: int,
+        kv_caches: KVCache,
+        model_name: str,
+        world_size: int,
+        engine_type: EngineType,
+        layout_hints: LayoutHints,
+        engine_group_infos: list[EngineGroupInfo],
+    ) -> None:
+        with self._lock:
+            self._register_kv_cache_inflight += 1
+            inflight = self._register_kv_cache_inflight
+        logger.info(
+            "[lmcache-busy-tracking] register_handler_enter inflight=%d",
+            inflight,
+        )
+        try:
+            return self.register_kv_cache(
+                instance_id,
+                kv_caches,
+                model_name,
+                world_size,
+                engine_type,
+                layout_hints,
+                engine_group_infos,
+            )
+        finally:
+            with self._lock:
+                self._register_kv_cache_inflight -= 1
+                inflight = self._register_kv_cache_inflight
+            logger.info(
+                "[lmcache-busy-tracking] register_handler_exit inflight=%d",
+                inflight,
+            )
+
     def get_handlers(self) -> list[HandlerSpec]:
         """Return handler specs for all request types this module serves.
 
@@ -852,7 +894,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         return [
             HandlerSpec(
                 RequestType.REGISTER_KV_CACHE,
-                self.register_kv_cache,
+                self._register_kv_cache_with_busy_state,
                 ThreadPoolType.SYNC,
             ),
             HandlerSpec(
