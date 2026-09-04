@@ -105,6 +105,35 @@ def _normalize_block_ids_for_kernel_groups(cache_context, gpu_block_ids, request
     return gpu_block_ids
 
 
+def _validate_kernel_group_block_ids(cache_context, gpu_block_ids, key, op_name):
+    """Validate that block IDs are indexed by LMCache kernel group.
+
+    Do not infer engine-group aliases here: a false mapping can transfer KV to
+    an invalid GPU block.  The caller records its existing IPC event and
+    reports a normal failed store/retrieve so vLLM safely recomputes.
+    """
+    manager = cache_context.kv_layer_groups_manager
+    expected = manager.num_kernel_groups
+    actual = len(gpu_block_ids)
+    if actual == expected:
+        return True
+
+    engine_group_ids = [
+        getattr(group, "engine_group_idx", idx)
+        for idx, group in enumerate(manager.kernel_groups)
+    ]
+    logger.error(
+        "%s block-id protocol mismatch for request_id=%s: actual_groups=%d, "
+        "expected_kernel_groups=%d, engine_group_ids=%s; skipping transfer",
+        op_name,
+        key.request_id,
+        actual,
+        expected,
+        engine_group_ids,
+    )
+    return False
+
+
 def get_layout_desc(
     cache_context: BaseCacheContext,
     num_tokens: int,
@@ -1064,6 +1093,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         ):
             event = event_backend.create_event(cache_context.device)
 
+            if not _validate_kernel_group_block_ids(
+                cache_context, gpu_block_ids, key, "STORE"
+            ):
+                event.record()
+                return event.ipc_handle(), False
+
             # Fail closed: every LMCache group must have block IDs covering all
             # chunks. A short list (e.g. a caller/protocol bug) would otherwise
             # drive the transfer kernel to read out-of-bounds GPU memory, so skip
@@ -1302,6 +1337,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             torch_dev.stream(cache_context.stream),
         ):
             event = event_backend.create_event(cache_context.device)
+
+            if not _validate_kernel_group_block_ids(
+                cache_context, gpu_block_ids, key, "RETRIEVE"
+            ):
+                event.record()
+                return event.ipc_handle(), False
 
             # Fail closed: a short block-id list would drive the transfer
             # kernel to write out-of-bounds GPU memory. Checked on the raw
