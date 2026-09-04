@@ -362,6 +362,16 @@ class PrefetchRequestSpec:
     policy: TrimPolicy = TrimPolicy.PREFIX
     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
     mode: PrefetchMode = PrefetchMode.LOOKUP
+    rank_group_layout_descs: dict[int, dict[int, MemoryLayoutDesc]] | None = None
+    """Per-kv_rank object-group layouts for L1 write-buffer allocation.
+
+    Maps kv_rank -> {object_group_id -> MemoryLayoutDesc}. PP deployments
+    with uneven layer partitions (e.g. 22/20/20/16) size each rank's objects
+    differently, so the flat ``group_layout_descs`` (from the last layout
+    registration) is wrong for every rank but one. When present, the prefetch
+    controller sizes each ObjectKey with the layout of its own kv_rank and
+    falls back to ``group_layout_descs`` for ranks not listed.
+    """
 
     def __post_init__(self) -> None:
         expected = set(range(self.attn_desc.num_object_groups))
@@ -371,6 +381,14 @@ class PrefetchRequestSpec:
                 f"object groups {sorted(expected)}, got "
                 f"{sorted(self.group_layout_descs)}"
             )
+        if self.rank_group_layout_descs is not None:
+            for kv_rank, gld in self.rank_group_layout_descs.items():
+                if set(gld) != expected:
+                    raise ValueError(
+                        "PrefetchRequestSpec: rank_group_layout_descs must map "
+                        f"exactly the object groups {sorted(expected)}, got "
+                        f"{sorted(gld)} for kv_rank={kv_rank}"
+                    )
 
 
 @dataclass(frozen=True)

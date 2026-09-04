@@ -316,12 +316,30 @@ class LookupModule:
             )
             return
 
+        # PP deployments with uneven layer partitions (e.g. GLM-5.2 PP=4 with
+        # 22/20/20/16 layers) size each kv_rank's object differently, but the
+        # flat registry entry only keeps the last registered layout. Collect
+        # each kv_rank present in the expanded keys and resolve its own
+        # per-object-group layouts so prefetch reserves the correct size per
+        # key instead of one size for every rank.
+        rank_group_layout_descs: dict[int, dict[int, MemoryLayoutDesc]] = {}
+        for obj_key in obj_keys:
+            kv_rank = obj_key.kv_rank
+            if kv_rank in rank_group_layout_descs:
+                continue
+            rank_gld = self._ctx.layout_desc_registry.find_rank_group_layout_descs(
+                model_name, world_size, kv_rank
+            )
+            if rank_gld is not None:
+                rank_group_layout_descs[kv_rank] = rank_gld
+
         handle = self._ctx.storage_manager.submit_prefetch_task(
             PrefetchRequestSpec(
                 keys=obj_keys,
                 group_layout_descs=group_layout_descs,
                 extra_count=extra_count,
                 attn_desc=attn_desc,
+                rank_group_layout_descs=rank_group_layout_descs or None,
             ),
             external_request_id=key.request_id,
         )

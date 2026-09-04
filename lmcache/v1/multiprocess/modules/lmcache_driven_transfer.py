@@ -1124,6 +1124,51 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
         num_chunks = len(obj_keys_per_obj_group[0])
 
+        # PP deployments split layers unevenly across kv ranks. The flat
+        # (model, world_size) layout registry keeps only the last registered
+        # layout, so prefetch loads would size other ranks' objects wrong.
+        # Record this rank's accurate per-object-group layouts now that the
+        # worker's kv_rank is known; lookups then size each ObjectKey by its
+        # own kv_rank.
+        #
+        # NOTE: object keys encode kv_rank via
+        # ObjectKey.ComputeKVRank(world_size, global_rank, local_world_size,
+        # local_rank) -> (ws<<24)|(rank<<16)|(lws<<8)|rank, so the registry
+        # key MUST use that encoded form (e.g. 0x04030403 for rank 3 of a
+        # PP=4 worker), not the raw worker_id (3). Using the raw id would
+        # never match the lookup-side obj_key.kv_rank and prefetch would fall
+        # back to the wrong flat layout.
+        if key.worker_id is not None:
+            try:
+                kv_rank = ObjectKey.ComputeKVRank(
+                    key.world_size,
+                    key.worker_id,
+                    key.world_size,
+                    key.worker_id,
+                )
+                rank_gld = {
+                    gid: get_layout_desc(
+                        cache_context,
+                        self._ctx.chunk_size,
+                        object_group_id=gid,
+                    )
+                    for gid in range(num_object_groups)
+                }
+                self._ctx.layout_desc_registry.register_rank_group_layout_descs(
+                    model_name,
+                    key.world_size,
+                    kv_rank,
+                    rank_gld,
+                )
+                logger.info(
+                    "[pprank] store registered kv_rank=0x%08x world=%d for %d groups",
+                    kv_rank,
+                    key.world_size,
+                    num_object_groups,
+                )
+            except Exception:
+                logger.exception("Failed to register per-rank layouts")
+
         # NOTE: different engine groups may have different block sizes, so
         # ``blocks_per_chunk[i]`` is the number of blocks in one chunk for
         # group ``i``.

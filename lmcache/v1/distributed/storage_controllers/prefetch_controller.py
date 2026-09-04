@@ -238,6 +238,13 @@ class InFlightPrefetchRequest:
     """Maps object_group_id to that group's layout (one ``MemoryLayoutDesc``
     describes a single group's MemoryObj). Covers every object group."""
 
+    rank_group_layout_descs: dict[int, dict[int, MemoryLayoutDesc]] = field(
+        default_factory=dict
+    )
+    """Per-kv_rank object-group layouts for L1 write-buffer allocation
+    (kv_rank -> {object_group_id -> MemoryLayoutDesc}). Sizes each rank's
+    objects correctly under uneven PP layer partitions."""
+
     def all_lookups_done(self) -> bool:
         return len(self.pending_lookup_tasks) == 0
 
@@ -893,6 +900,8 @@ class PrefetchController(StorageControllerInterface):
             attn_desc=spec.attn_desc,
             mode=spec.mode,
             group_layout_descs=spec.group_layout_descs,
+            rank_group_layout_descs=getattr(spec, "rank_group_layout_descs", None)
+            or {},
             l1_readlocks=l1_readlocks,
         )
 
@@ -1068,19 +1077,39 @@ class PrefetchController(StorageControllerInterface):
         retention_map = dict(zip(keys_to_reserve, retentions, strict=True))
 
         # Batch reserve_write by object_group_id so each group uses its own
-        # tensor shapes.
+        # tensor shapes. PP deployments with uneven layer partitions
+        # (22/20/20/16) further split each group by kv_rank because each
+        # rank's object size differs; the flat layout only matches one rank.
         write_results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
+        rank_gld = getattr(request, "rank_group_layout_descs", None)
         by_group = sorted(keys_to_reserve, key=attrgetter("object_group_id"))
         for gid, group_iter in groupby(by_group, key=attrgetter("object_group_id")):
             group_keys = list(group_iter)
             gld = request.group_layout_descs[gid]
-            gr = self._l1_manager.reserve_write(
-                keys=group_keys,
-                is_temporary=[not retention_map[k] for k in group_keys],
-                layout_desc=gld,
-                mode="new",
-            )
-            write_results.update(gr)
+            if rank_gld:
+                # Split into per-kv_rank sub-batches; each rank keeps its own
+                # accurate layout. Ranks without a registered per-rank layout
+                # (single-header deployments) fall back to the flat layout.
+                sub_batches: list[tuple[list[ObjectKey], object]] = []
+                by_rank = sorted(
+                    group_keys, key=lambda k: (k.kv_rank, k.object_group_id)
+                )
+                for _, rank_iter in groupby(
+                    by_rank, key=lambda k: k.kv_rank
+                ):
+                    rank_keys = list(rank_iter)
+                    rank_layout = rank_gld.get(rank_keys[0].kv_rank, {}).get(gid, gld)
+                    sub_batches.append((rank_keys, rank_layout))
+            else:
+                sub_batches = [(group_keys, gld)]
+            for rank_keys, rank_layout in sub_batches:
+                gr = self._l1_manager.reserve_write(
+                    keys=rank_keys,
+                    is_temporary=[not retention_map[k] for k in rank_keys],
+                    layout_desc=rank_layout,
+                    mode="new",
+                )
+                write_results.update(gr)
 
         reserved: set[ObjectKey] = set()
         oom_keys: list[ObjectKey] = []

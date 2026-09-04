@@ -47,6 +47,11 @@ class _LayoutDescEntry:
     order. Defaults to a single full-attention group."""
     group_layout_descs: dict[int, MemoryLayoutDesc] | None = None
     """Per-group layout descriptors, or ``None`` if all share ``layout_desc``."""
+    rank_group_layout_descs: dict[int, dict[int, MemoryLayoutDesc]] | None = None
+    """Per-kv_rank per-group layout descriptors. Populated by store-path
+    registrations so PP workers with unequal layer partitions resolve the
+    correct object size for each rank during prefetch load. Maps
+    kv_rank -> {object_group_id -> MemoryLayoutDesc}."""
 
 
 class LayoutDescRegistry:
@@ -109,6 +114,68 @@ class LayoutDescRegistry:
             entry.attn_desc = attn_desc
             entry.group_layout_descs = group_layout_descs
             entry.ref_count += 1
+
+    def register_rank_group_layout_descs(
+        self,
+        model_name: str,
+        world_size: int,
+        kv_rank: int,
+        group_layout_descs: dict[int, MemoryLayoutDesc],
+    ) -> None:
+        """Register per-kv_rank object-group layouts for a (model, ws) pair.
+
+        PP deployments split the model's layers across ranks unevenly
+        (e.g. 22/20/20/16). Each rank's worker registers its own KV cache,
+        and the flat ``(model_name, world_size)`` registry entry keeps only
+        the last writer's layout, so prefetch loads sized other ranks'
+        objects wrong. Store-path callers add their rank's accurate
+        ``group_layout_descs`` here so lookups can size each ObjectKey by
+        its own kv_rank.
+
+        Args:
+            model_name: The model name.
+            world_size: The world size.
+            kv_rank: The kv_rank (PP rank) owning this layout.
+            group_layout_descs: Maps object_group_id to that group's layout.
+        """
+        key = (model_name, world_size)
+        with self._lock:
+            entry = self._registry.get(key)
+            if entry is None:
+                entry = _LayoutDescEntry(
+                    layout_desc=next(iter(group_layout_descs.values())),
+                    ref_count=1,
+                )
+                self._registry[key] = entry
+            if entry.rank_group_layout_descs is None:
+                entry.rank_group_layout_descs = {}
+            entry.rank_group_layout_descs[kv_rank] = group_layout_descs
+
+    def find_rank_group_layout_descs(
+        self,
+        model_name: str,
+        world_size: int,
+        kv_rank: int,
+    ) -> dict[int, MemoryLayoutDesc] | None:
+        """Look up per-object-group layouts for a specific kv_rank.
+
+        When per-rank layouts were registered for this (model, world_size)
+        pair (i.e. uneven PP layer partitions), the lookup MUST yield an
+        exact per-rank layout; falling back to the flat (last-registered)
+        layout would size this rank's objects wrong and cause incomplete L2
+        reads. Returns ``None`` when the exact rank is unknown so callers
+        skip prefetching that rank rather than mis-size it. For non-PP
+        deployments (no per-rank registrations) the flat layout is returned.
+        """
+        with self._lock:
+            entry = self._registry.get((model_name, world_size))
+            if entry is None:
+                return None
+            rank_layouts = entry.rank_group_layout_descs
+            if rank_layouts:
+                # Per-rank mode is active: exact match required.
+                return rank_layouts.get(kv_rank)
+            return entry.group_layout_descs
 
     def unregister(self, model_name: str, world_size: int) -> None:
         """Unregister one layout descriptor registration for a pair.
