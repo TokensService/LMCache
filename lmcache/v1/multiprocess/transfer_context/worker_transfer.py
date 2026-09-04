@@ -498,6 +498,34 @@ class LMCacheDrivenTransferContext(TransferContext):
         )
         future.result(timeout=mq_timeout)
 
+    def is_work_doing_register_kv_cache(self, mq_timeout: float) -> bool:
+        """Query the LMCache server busy bit through the existing MQ client.
+
+        Args:
+            mq_timeout: Timeout in seconds for the MQ round trip.
+
+        Returns:
+            True while the server-side REGISTER_KV_CACHE handler is running.
+
+        Raises:
+            RuntimeError: If the context was never registered, or the server
+                returns a non-bool response.
+        """
+        if self._mq_client is None or self._send_request is None:
+            raise RuntimeError(
+                "LMCache-driven transfer context is not registered. "
+                "Call register() before querying register state."
+            )
+        future = self._send_request(
+            self._mq_client,
+            RequestType.QUERY_REGISTER_KV_CACHE_BUSY,
+            [],
+        )
+        busy = future.result(timeout=mq_timeout)
+        if not isinstance(busy, bool):
+            raise RuntimeError(f"invalid LMCache register busy response: {busy!r}")
+        return busy
+
     def submit_store(
         self,
         _request_id: str,

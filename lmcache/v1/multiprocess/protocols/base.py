@@ -70,6 +70,9 @@ class RequestType(enum.Enum):
     # Debug operations
     NOOP = enum.auto()
 
+    # Observability operations (engine group)
+    QUERY_REGISTER_KV_CACHE_BUSY = enum.auto()
+
     # Blend operations
     CB_REGISTER_KV_CACHE = enum.auto()
     CB_UNREGISTER_KV_CACHE = enum.auto()

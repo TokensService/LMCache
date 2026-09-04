@@ -59,6 +59,7 @@ class RegisterEngineDrivenContextResponse:
 # Define request names for this protocol group
 REQUEST_NAMES = [
     "REGISTER_KV_CACHE",
+    "QUERY_REGISTER_KV_CACHE_BUSY",
     "UNREGISTER_KV_CACHE",
     "REGISTER_Q_CACHE",
     "UNREGISTER_Q_CACHE",
@@ -114,6 +115,14 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
                 list[EngineGroupInfo],
             ],
             response_class=None,
+            handler_type=HandlerType.SYNC,
+        ),
+        # Query REGISTER_KV_CACHE busy state
+        # Payload: (empty)
+        # Returns: bool - True while any REGISTER_KV_CACHE handler is running
+        "QUERY_REGISTER_KV_CACHE_BUSY": ProtocolDefinition(
+            payload_classes=[],
+            response_class=bool,
             handler_type=HandlerType.SYNC,
         ),
         # Unregister KV Cache

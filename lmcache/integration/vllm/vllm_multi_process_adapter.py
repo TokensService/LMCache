@@ -1234,6 +1234,24 @@ class LMCacheMPWorkerAdapter:
         self.engine_group_infos = list(engine_group_infos)
         self._send_register_kv_caches_request(kv_caches)
 
+    def is_work_doing_register_kv_cache(self) -> bool:
+        """Return the LMCache server register busy bit through MQ.
+
+        Returns:
+            True while the server-side REGISTER_KV_CACHE handler for this
+            worker is still running.
+
+        Raises:
+            RuntimeError: If the transfer context does not support the
+                register busy query (non-LMCache-driven context).
+        """
+        checker = getattr(self.transfer_ctx, "is_work_doing_register_kv_cache", None)
+        if checker is None:
+            raise RuntimeError(
+                "LMCache transfer context does not support register busy query"
+            )
+        return checker(self._mq_timeout)
+
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
 

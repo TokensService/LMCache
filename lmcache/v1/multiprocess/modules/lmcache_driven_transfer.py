@@ -898,6 +898,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 ThreadPoolType.SYNC,
             ),
             HandlerSpec(
+                RequestType.QUERY_REGISTER_KV_CACHE_BUSY,
+                self.is_work_doing_register_kv_cache,
+                ThreadPoolType.SYNC,
+            ),
+            HandlerSpec(
                 RequestType.UNREGISTER_KV_CACHE,
                 self.unregister_kv_cache,
                 ThreadPoolType.SYNC,

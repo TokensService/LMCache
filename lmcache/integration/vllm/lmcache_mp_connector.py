@@ -825,6 +825,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return
 
+    def is_work_doing_register_kv_cache(self) -> bool:
+        """Query LMCache server registration state through the worker MQ path.
+
+        Returns:
+            True while the LMCache server is still running this worker's
+            REGISTER_KV_CACHE handler.
+        """
+        return self.worker_adapter.is_work_doing_register_kv_cache()
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """
         Start loading the KV cache from the connector to vLLM's paged
