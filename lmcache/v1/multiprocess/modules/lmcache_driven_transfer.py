@@ -61,6 +61,50 @@ _HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = hasattr(
 )
 
 
+def _normalize_block_ids_for_kernel_groups(cache_context, gpu_block_ids, request_id, op_name):
+    """Normalize vLLM engine-group block ids to LMCache kernel-group block ids.
+
+    vLLM may send block ids indexed by engine group, while LMCache store/retrieve
+    below is indexed by kernel group. GLM5.2 MLA/index-cache ranks can have
+    multiple LMCache kernel groups that share one engine group. Reuse the same
+    engine-group block-id list for each kernel group that maps to it.
+    """
+    manager = cache_context.kv_layer_groups_manager
+    num_kernel_groups = manager.num_kernel_groups
+    if len(gpu_block_ids) == num_kernel_groups:
+        return gpu_block_ids
+
+    engine_group_ids = [
+        getattr(group, "engine_group_idx", idx)
+        for idx, group in enumerate(manager.kernel_groups)
+    ]
+    num_engine_groups = max(engine_group_ids, default=-1) + 1
+    if len(gpu_block_ids) == num_engine_groups:
+        expanded = [list(gpu_block_ids[engine_group_id]) for engine_group_id in engine_group_ids]
+        logger.info(
+            "%s normalized block ids for request_id=%s: engine_groups=%d, "
+            "kernel_groups=%d, engine_group_ids=%s",
+            op_name,
+            request_id,
+            num_engine_groups,
+            num_kernel_groups,
+            engine_group_ids,
+        )
+        return expanded
+
+    logger.error(
+        "%s block-id group count mismatch for request_id=%s: got=%d, "
+        "engine_groups=%d, kernel_groups=%d, engine_group_ids=%s",
+        op_name,
+        request_id,
+        len(gpu_block_ids),
+        num_engine_groups,
+        num_kernel_groups,
+        engine_group_ids,
+    )
+    return gpu_block_ids
+
+
 def get_layout_desc(
     cache_context: BaseCacheContext,
     num_tokens: int,
@@ -995,6 +1039,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         if event_backend is None:
             raise RuntimeError("Registered cache context has no event backend")
 
+        gpu_block_ids = _normalize_block_ids_for_kernel_groups(
+            cache_context, gpu_block_ids, key.request_id, "STORE"
+        )
         num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
         obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
             key, list(range(num_object_groups))
@@ -1237,6 +1284,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     "model_name": model_name,
                 },
             ),
+        )
+
+        gpu_block_ids = _normalize_block_ids_for_kernel_groups(
+            cache_context, gpu_block_ids, key.request_id, "RETRIEVE"
         )
 
         blocks_per_chunk = [
