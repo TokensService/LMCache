@@ -160,3 +160,6 @@ docs/source/locale/**/*.mo
 
 # CodeBuddy
 .codebuddy
+
+# 本地 wheel 构建产物
+/built/
