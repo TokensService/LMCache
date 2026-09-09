@@ -40,19 +40,31 @@ EOF
 [[ "${1:-}" != --help && "${1:-}" != -h ]] || { usage; exit 0; }
 log() { printf '[build-lmcache] %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# CI 构建镜像可以不带 git：外层已固定分支/发布版本，仍须在产物中保留可追溯信息。
+source_metadata() {
+  if command -v git >/dev/null && git -C "$REPO_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+    SOURCE_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD)"
+    SOURCE_DESCRIBE="$(git -C "$REPO_DIR" describe --tags --always --dirty)"
+    SOURCE_DIRTY=false
+    [[ -z "$(git -C "$REPO_DIR" status --porcelain)" ]] || SOURCE_DIRTY=true
+    return
+  fi
+
+  SOURCE_COMMIT="${SOURCE_COMMIT:-${GIT_COMMIT:-${CI_COMMIT_SHA:-unknown}}}"
+  SOURCE_DESCRIBE="${SOURCE_DESCRIBE:-${RELEASE_TAG:-${GIT_BRANCH:-unknown}}}"
+  SOURCE_DIRTY="${SOURCE_DIRTY:-unknown}"
+  log "git 不可用，使用 CI 版本信息：commit=$SOURCE_COMMIT describe=$SOURCE_DESCRIBE"
+}
 [[ $# == 0 ]] || die '使用环境变量配置，不支持位置参数'
 for flag in INSTALL_DEPS BUILD_WITH_MOONCAKE BUILD_WITH_AEROSPIKE BUILD_RUST; do
   [[ "${!flag}" =~ ^[01]$ ]] || die "$flag 必须为 0 或 1"
 done
 [[ -f "$REPO_DIR/setup.py" && -d "$REPO_DIR/setup_extensions" ]] || die 'REPO_DIR 不是支持的 LMCache 源码目录'
 command -v "$PYTHON" >/dev/null || die '未找到 PYTHON'
-command -v git >/dev/null || die '需要 git 记录版本信息'
 REPO_DIR="$(cd "$REPO_DIR" && pwd -P)"
 cd "$REPO_DIR"
-SOURCE_COMMIT="$(git rev-parse HEAD)"
-SOURCE_DESCRIBE="$(git describe --tags --always --dirty)"
-SOURCE_DIRTY=false
-[[ -z "$(git status --porcelain)" ]] || SOURCE_DIRTY=true
+source_metadata
 TORCH_INFO="$("$PYTHON" - <<'PY'
 import sys, torch
 if not torch.version.cuda:
