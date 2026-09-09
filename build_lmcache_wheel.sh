@@ -112,25 +112,55 @@ export CUDA_HOME PATH="$CUDA_HOME/bin:$PATH"
 export ENABLE_CXX11_ABI="$TORCH_ABI" LMCACHE_CUDA_MAJOR="${TORCH_CUDA%%.*}" TORCH_CUDA_ARCH_LIST
 [[ "$LMCACHE_CUDA_MAJOR" == 12 || "$LMCACHE_CUDA_MAJOR" == 13 ]] || die '该分支只提供 CUDA 12/13 依赖配置'
 # 精简开发环境可由 Torch 配套的 NVIDIA wheel 提供 CUDA 库头文件。
-# 只选同 CUDA 主版本的发行包，不能混用系统另一版本的 include。
-NVIDIA_INCLUDES="$("$PYTHON" - "$LMCACHE_CUDA_MAJOR" <<'PY_INCLUDES'
+# CUDA 13 的 cuSPARSE 当前也会以无 -cu13 后缀的 nvidia-cusparse 发行。
+collect_nvidia_include_paths() {
+  "$PYTHON" - "$LMCACHE_CUDA_MAJOR" <<'PY_INCLUDES'
 import importlib.metadata as metadata
 import pathlib
 import sys
+major=sys.argv[1]
 paths=set()
 for distribution in metadata.distributions():
-    name=distribution.metadata.get('Name','').lower()
-    if not (name.startswith('nvidia-') and name.endswith('-cu'+sys.argv[1])):
+    name=(distribution.metadata.get('Name') or '').lower()
+    compatible=name.startswith('nvidia-') and name.endswith('-cu'+major)
+    compatible |= major == '13' and name == 'nvidia-cusparse'
+    if not compatible:
         continue
     for file in distribution.files or []:
         parts=file.parts
         if 'include' in parts:
             directory=pathlib.Path(distribution.locate_file(pathlib.PurePosixPath(*parts[:parts.index('include')+1])))
-            if directory.is_dir():paths.add(str(directory))
+            if directory.is_dir(): paths.add(str(directory))
 print(':'.join(sorted(paths)))
 PY_INCLUDES
-)"
-[[ -z "$NVIDIA_INCLUDES" ]] || export CPATH="$NVIDIA_INCLUDES${CPATH:+:$CPATH}"
+}
+has_cusparse_header() {
+  [[ -f "$CUDA_HOME/include/cusparse.h" ]] && return 0
+  local directory
+  IFS=: read -r -a directories <<< "$1"
+  for directory in "${directories[@]}"; do
+    [[ -f "$directory/cusparse.h" ]] && return 0
+  done
+  return 1
+}
+torch_cusparse_requirement() {
+  "$PYTHON" - "$LMCACHE_CUDA_MAJOR" <<'PY_CUSPARSE'
+import importlib.metadata as metadata
+import sys
+from packaging.requirements import Requirement
+major=sys.argv[1]
+for raw in metadata.distribution('torch').requires or ():
+    requirement=Requirement(raw)
+    if requirement.marker and not requirement.marker.evaluate():
+        continue
+    name=requirement.name.lower()
+    if name == 'nvidia-cusparse' or name == f'nvidia-cusparse-cu{major}':
+        print(str(requirement))
+        break
+else:
+    print('nvidia-cusparse' if major == '13' else f'nvidia-cusparse-cu{major}')
+PY_CUSPARSE
+}
 export BUILD_WITH_CUDA=1 NO_NATIVE_EXT=0 NO_GPU_EXT=0 NO_CUDA_EXT=0
 unset BUILD_WITH_HIP BUILD_WITH_SYCL BUILD_WITH_MUSA
 export BUILD_WITH_MOONCAKE BUILD_MOONCAKE="$BUILD_WITH_MOONCAKE"
@@ -207,6 +237,16 @@ if ! check_python_deps; then
   install_python_deps -r requirements/build.txt
   check_python_deps
 fi
+NVIDIA_INCLUDES="$(collect_nvidia_include_paths)"
+if ! has_cusparse_header "$NVIDIA_INCLUDES"; then
+  [[ "$INSTALL_DEPS" == 1 ]] || die '缺少 cusparse.h；请安装与 Torch 匹配的 cuSPARSE 开发包'
+  CUSPARSE_REQUIREMENT="$(torch_cusparse_requirement)"
+  log "缺少 cusparse.h，安装 Torch 匹配依赖：$CUSPARSE_REQUIREMENT"
+  install_python_deps "$CUSPARSE_REQUIREMENT"
+  NVIDIA_INCLUDES="$(collect_nvidia_include_paths)"
+  has_cusparse_header "$NVIDIA_INCLUDES" || die '安装 cuSPARSE 后仍未找到 cusparse.h'
+fi
+[[ -z "$NVIDIA_INCLUDES" ]] || export CPATH="$NVIDIA_INCLUDES${CPATH:+:$CPATH}"
 if [[ "$BUILD_RUST" == 1 ]] && ! "$PYTHON" -c 'import importlib.metadata as m; from packaging.version import Version; assert Version(m.version("maturin")) >= Version("1.8")' >/dev/null 2>&1; then
   [[ "$INSTALL_DEPS" == 1 ]] || die '缺少 maturin>=1.8'
   install_python_deps 'maturin>=1.8'
