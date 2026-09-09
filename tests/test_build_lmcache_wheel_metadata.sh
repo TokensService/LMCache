@@ -10,13 +10,20 @@ METADATA_FUNCTION="$(sed -n '/^source_metadata()/,/^}/p' "$SCRIPT")"
   printf 'source_metadata helper is missing\n' >&2
   exit 1
 }
+SCM_FUNCTION="$(sed -n '/^configure_setuptools_scm()/,/^}/p' "$SCRIPT")"
+[[ -n "$SCM_FUNCTION" ]] || {
+  printf 'configure_setuptools_scm helper is missing\n' >&2
+  exit 1
+}
 
 output="$(env -i PATH=/definitely-without-git GIT_BRANCH=v0.5.3-ppfix RELEASE_TAG=v0.1.0 \
-  /bin/bash -c "log() { :; }
+  PYTHON="$(command -v python3)" /bin/bash -c "log() { :; }
 $METADATA_FUNCTION
+$SCM_FUNCTION
 source_metadata
-printf '%s|%s|%s\n' \"\$SOURCE_COMMIT\" \"\$SOURCE_DESCRIBE\" \"\$SOURCE_DIRTY\"")"
-[[ "$output" == 'unknown|v0.1.0|unknown' ]] || {
+configure_setuptools_scm
+printf '%s|%s|%s|%s\n' \"\$SOURCE_COMMIT\" \"\$SOURCE_DESCRIBE\" \"\$SOURCE_DIRTY\" \"\$SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE\"")"
+[[ "$output" == 'unknown|v0.1.0|unknown|0.1.0' ]] || {
   printf 'unexpected metadata fallback: %s\n' "$output" >&2
   exit 1
 }

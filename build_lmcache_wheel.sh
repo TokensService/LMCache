@@ -56,6 +56,27 @@ source_metadata() {
   SOURCE_DIRTY="${SOURCE_DIRTY:-unknown}"
   log "git 不可用，使用 CI 版本信息：commit=$SOURCE_COMMIT describe=$SOURCE_DESCRIBE"
 }
+
+# setuptools-scm 在元数据阶段也会调用 git。无 git 的 CI 镜像需传入 PEP 440 版本。
+configure_setuptools_scm() {
+  [[ -n "${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE:-}" ]] && return
+  if command -v git >/dev/null && git -C "$REPO_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+    return
+  fi
+
+  local version="${RELEASE_TAG:-${RELEASE_NAME:-}}"
+  [[ "$version" =~ ^v[0-9] ]] && version="${version#v}"
+  if ! "$PYTHON" - "$version" <<'PY' >/dev/null 2>&1
+from packaging.version import Version
+import sys
+Version(sys.argv[1])
+PY
+  then
+    version='0+unknown'
+  fi
+  export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE="$version"
+  log "git 不可用，设置 setuptools-scm 版本：$SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE"
+}
 [[ $# == 0 ]] || die '使用环境变量配置，不支持位置参数'
 for flag in INSTALL_DEPS BUILD_WITH_MOONCAKE BUILD_WITH_AEROSPIKE BUILD_RUST; do
   [[ "${!flag}" =~ ^[01]$ ]] || die "$flag 必须为 0 或 1"
@@ -190,6 +211,7 @@ if [[ "$BUILD_RUST" == 1 ]] && ! "$PYTHON" -c 'import importlib.metadata as m; f
   [[ "$INSTALL_DEPS" == 1 ]] || die '缺少 maturin>=1.8'
   install_python_deps 'maturin>=1.8'
 fi
+configure_setuptools_scm
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
 stage="$(mktemp -d "$OUTPUT_DIR/.lmcache-build.XXXXXX")"
