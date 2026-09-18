@@ -665,7 +665,15 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
         """
-        val = self.worker_adapter.get_finished(finished_req_ids)
+        # get_finished() may also be called on a SCHEDULER-role connector
+        # (e.g. the XDS patch's _drain_inflight_kv_transfer polls it to
+        # release in-flight KV transfers during prefix-cache reset).
+        # worker_adapter only exists on WORKER-role instances (see __init__);
+        # without this guard the call below raises AttributeError.
+        worker_adapter = getattr(self, "worker_adapter", None)
+        if worker_adapter is None:
+            return set(), set()
+        val = worker_adapter.get_finished(finished_req_ids)
         # logger.error("Finished req ids: %s, %s", val[0], val[1])
         return val
 
