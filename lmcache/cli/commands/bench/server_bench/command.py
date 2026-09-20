@@ -50,6 +50,7 @@ from lmcache import torch_dev
 # ``_require_full_install`` guard inside the helpers module keeps
 # orchestration safe.
 from lmcache.cli.commands.bench.server_bench.helpers import (
+    _DEFAULT_RPC_TIMEOUT_S,
     _DEFAULT_SHAPE_SPEC,
     _INSTANCE_ID_BASE,
     DTYPE_MAP,
@@ -440,7 +441,9 @@ def run_server_bench(
     )
 
     ctx = zmq.Context()
-    client = MessageQueueClient(url, ctx)
+    # TTL strictly greater than the bench RPC timeout so the MQ client's
+    # expiry sweep never preempts a caller's own result(timeout).
+    client = MessageQueueClient(url, ctx, request_ttl_s=_DEFAULT_RPC_TIMEOUT_S + 60.0)
 
     # Tracks whether REGISTER_KV_CACHE succeeded so the ``finally`` block
     # only deregisters a context that was actually registered.

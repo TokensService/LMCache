@@ -132,8 +132,13 @@ class P2PL2Adapter(L2AdapterInterface):
         super().__init__(max_capacity_bytes=0)
         self._config = config
 
+        # TTL strictly greater than the longest synchronous RPC wait so the
+        # MQ client's expiry sweep never preempts a caller's own
+        # result(timeout).
         self._mq_client = MessageQueueClient(
-            config.peer_mq_server_url, zmq.Context.instance()
+            config.peer_mq_server_url,
+            zmq.Context.instance(),
+            request_ttl_s=_LOOKUP_RPC_TIMEOUT_S + 60.0,
         )
         self._tc_context = get_transfer_channel_context()
         self._tc_client = self._tc_context.get_transfer_channel_client(

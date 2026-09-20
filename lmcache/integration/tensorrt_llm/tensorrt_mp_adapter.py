@@ -87,11 +87,15 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
         self._pending: dict = {}
 
         self._zmq_context = zmq.Context()
-        self._mq_client = MessageQueueClient(
-            _get_server_url(self._llm_args), self._zmq_context
-        )
         self._mq_timeout = float(
             os.environ.get("LMCACHE_MQ_TIMEOUT", DEFAULT_MQ_TIMEOUT)
+        )
+        # TTL strictly greater than the synchronous RPC timeout so the MQ
+        # client's expiry sweep never preempts a caller's own result(timeout).
+        self._mq_client = MessageQueueClient(
+            _get_server_url(self._llm_args),
+            self._zmq_context,
+            request_ttl_s=self._mq_timeout + 60.0,
         )
 
         future = _send_request(self._mq_client, RequestType.GET_CHUNK_SIZE, [])
@@ -281,11 +285,15 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
         self._block_size: int = self._llm_args.kv_cache_config.tokens_per_block
 
         self._zmq_context = zmq.Context()
-        self._mq_client = MessageQueueClient(
-            _get_server_url(self._llm_args), self._zmq_context
-        )
         self._mq_timeout = float(
             os.environ.get("LMCACHE_MQ_TIMEOUT", DEFAULT_MQ_TIMEOUT)
+        )
+        # TTL strictly greater than the synchronous RPC timeout so the MQ
+        # client's expiry sweep never preempts a caller's own result(timeout).
+        self._mq_client = MessageQueueClient(
+            _get_server_url(self._llm_args),
+            self._zmq_context,
+            request_ttl_s=self._mq_timeout + 60.0,
         )
 
         self._instance_id = os.getpid()

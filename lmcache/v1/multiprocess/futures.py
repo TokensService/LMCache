@@ -16,6 +16,7 @@ class MessagingFuture(Generic[T]):
     def __init__(self):
         self.is_done_ = threading.Event()
         self.result_ = None
+        self.exception_: Optional[BaseException] = None
 
     def query(self) -> bool:
         """
@@ -52,11 +53,29 @@ class MessagingFuture(Generic[T]):
 
         Raises:
             TimeoutError: If the future is not done within the timeout.
+            BaseException: The exception attached via :meth:`set_exception`
+                (e.g. ``LMCacheRequestExpiredError`` when the MQ client's TTL
+                sweep expired the request without a server response).
         """
         flag = self.wait(timeout)
         if not flag:
             raise LMCacheTimeoutError("Future result not available within timeout")
+        if self.exception_ is not None:
+            raise self.exception_
         return self.result_
+
+    def set_exception(self, exception: BaseException) -> None:
+        """Attach a failure to this future and mark it done.
+
+        Used by the messaging system (MQ client TTL sweep) to fail a request
+        that never received a response. ``result()`` raises the attached
+        exception; ``query()``/``wait()`` report the future as done.
+
+        Args:
+            exception: The exception ``result()`` should raise.
+        """
+        self.exception_ = exception
+        self.is_done_.set()
 
     def set_result(self, result: T) -> None:
         """
@@ -120,6 +139,11 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         self.raw_future_ = raw_future
         self.event_: Any | None = None
         self.result_: T | None = None
+        # Set when the raw future was failed by the MQ client's TTL sweep
+        # (the server never responded). Such a future carries no device
+        # event; wait()/result() re-raise the sweep's exception.
+        self.timed_out_: bool = False
+        self.timed_out_exception_: Optional[BaseException] = None
         self.device_ = device if device is not None else torch_dev.current_device()
         self._event_backend = get_event_ipc_backend(self.device_)
         self._event_backend.check_event_support(self.device_)
@@ -127,7 +151,16 @@ class DeviceMessagingFuture(MessagingFuture[T]):
     def _on_raw_future_complete(self) -> None:
         """
         Update the device event and result when the raw future is complete.
+
+        A raw future carrying an exception means the request was expired by
+        the MQ client's TTL sweep without ever receiving a response; in that
+        case ``timed_out_`` is set and no device event is imported.
         """
+        if self.raw_future_.exception_ is not None:
+            self.timed_out_ = True
+            self.timed_out_exception_ = self.raw_future_.exception_
+            return
+
         event_bytes, result = self.raw_future_.result()
         self.result_ = result
 
@@ -158,6 +191,10 @@ class DeviceMessagingFuture(MessagingFuture[T]):
             return False
 
         self._on_raw_future_complete()
+
+        if self.timed_out_:
+            assert self.timed_out_exception_ is not None
+            raise self.timed_out_exception_
 
         assert self.event_ is not None
         self._event_backend.synchronize_event(self.event_, self.device_)
@@ -199,8 +236,13 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         if self.event_:
             return self._event_backend.query_event(self.event_)
 
+        if self.timed_out_:
+            return True
+
         if self.raw_future_.query():
             self._on_raw_future_complete()
+            if self.timed_out_:
+                return True
             assert self.event_ is not None
             return self._event_backend.query_event(self.event_)
 
