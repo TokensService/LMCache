@@ -37,3 +37,21 @@ printf '%s\n' \"\$SOURCE_COMMIT\"")"
   printf 'git metadata was not preserved: %s\n' "$output" >&2
   exit 1
 }
+
+output="$(REPO_DIR="$REPO_DIR" WHEEL_VERSION=v0.5.3+glm PYTHON="$(command -v python3)" bash -c "log() { :; }
+die() { printf '%s\\n' \"\$*\" >&2; exit 1; }
+$SCM_FUNCTION
+configure_setuptools_scm
+printf '%s\n' \"\$SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE\"")"
+[[ "$output" == '0.5.3+glm' ]] || {
+  printf 'explicit wheel version did not override git metadata: %s\n' "$output" >&2
+  exit 1
+}
+
+if REPO_DIR="$REPO_DIR" WHEEL_VERSION='not a version!' PYTHON="$(command -v python3)" bash -c "log() { :; }
+die() { printf '%s\\n' \"\$*\" >&2; exit 1; }
+$SCM_FUNCTION
+configure_setuptools_scm" >/dev/null 2>&1; then
+  printf 'invalid explicit wheel version was accepted\n' >&2
+  exit 1
+fi
