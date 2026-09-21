@@ -61,7 +61,9 @@ _HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = hasattr(
 )
 
 
-def _normalize_block_ids_for_kernel_groups(cache_context, gpu_block_ids, request_id, op_name):
+def _normalize_block_ids_for_kernel_groups(
+    cache_context, gpu_block_ids, request_id, op_name
+):
     """Normalize vLLM engine-group block ids to LMCache kernel-group block ids.
 
     vLLM may send block ids indexed by engine group, while LMCache store/retrieve
@@ -80,7 +82,9 @@ def _normalize_block_ids_for_kernel_groups(cache_context, gpu_block_ids, request
     ]
     num_engine_groups = max(engine_group_ids, default=-1) + 1
     if len(gpu_block_ids) == num_engine_groups:
-        expanded = [list(gpu_block_ids[engine_group_id]) for engine_group_id in engine_group_ids]
+        expanded = [
+            list(gpu_block_ids[engine_group_id]) for engine_group_id in engine_group_ids
+        ]
         logger.info(
             "%s normalized block ids for request_id=%s: engine_groups=%d, "
             "kernel_groups=%d, engine_group_ids=%s",
@@ -671,6 +675,9 @@ class ContextEntry:
             PING. Selects the reap window (timeout vs registration grace).
             Latched only by PING, never by traffic.
         event_backend: Cached event backend selected for this context's device.
+        last_ping: ``time.monotonic()`` when the most recent PING from this
+            instance reached the server. Kept separately from ``last_seen``
+            so status can report real MP heartbeat health rather than traffic.
     """
 
     cache_context: BaseCacheContext
@@ -679,6 +686,7 @@ class ContextEntry:
     last_seen: float = 0.0
     has_liveness_signal: bool = False
     event_backend: EventIPCBackend | None = None
+    last_ping: float | None = None
 
 
 class LMCacheDrivenTransferModule(InstanceLivenessTarget):
@@ -689,9 +697,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     Args:
         ctx: The shared engine context.
+        worker_reap_timeout_seconds: Timeout for a PING-proven worker.
+        worker_registration_grace_seconds: Timeout before a worker sends its
+            first PING.
     """
 
-    def __init__(self, ctx: MPCacheServerContext) -> None:
+    def __init__(
+        self,
+        ctx: MPCacheServerContext,
+        worker_reap_timeout_seconds: float = 0.0,
+        worker_registration_grace_seconds: float = 0.0,
+    ) -> None:
         self._ctx = ctx
         self._cache_contexts: dict[int, ContextEntry] = {}
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
@@ -701,6 +717,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # empty_cache (leaf-lock invariant: no thread holds two locks).
         self._lock = threading.Lock()
         self._register_kv_cache_inflight = 0
+        self._registering_instance_counts: dict[int, int] = {}
+        self._worker_reap_timeout_seconds = worker_reap_timeout_seconds
+        self._worker_registration_grace_seconds = worker_registration_grace_seconds
 
         # Route finish_write / finish_read_prefetched through a C++ host
         # callback so the driver thread doesn't acquire the GIL.
@@ -766,6 +785,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             if entry is not None:
                 entry.last_seen = now
                 entry.has_liveness_signal = True
+                entry.last_ping = now
 
     def tracked_instance_count(self) -> int:
         """Return the number of currently registered instances."""
@@ -860,6 +880,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
     ) -> None:
         with self._lock:
             self._register_kv_cache_inflight += 1
+            self._registering_instance_counts[instance_id] = (
+                self._registering_instance_counts.get(instance_id, 0) + 1
+            )
             inflight = self._register_kv_cache_inflight
         logger.info(
             "[lmcache-busy-tracking] register_handler_enter inflight=%d",
@@ -878,6 +901,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         finally:
             with self._lock:
                 self._register_kv_cache_inflight -= 1
+                remaining = self._registering_instance_counts[instance_id] - 1
+                if remaining:
+                    self._registering_instance_counts[instance_id] = remaining
+                else:
+                    del self._registering_instance_counts[instance_id]
                 inflight = self._register_kv_cache_inflight
             logger.info(
                 "[lmcache-busy-tracking] register_handler_exit inflight=%d",
@@ -924,12 +952,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
         Returns:
             A dict containing registered GPU instance IDs and
-            per-instance KV cache layout metadata.
+            per-instance KV cache layout metadata. ``mp_links`` is a
+            read-only snapshot of registration and real MP PING state; it
+            never sends an MP request or accesses GPU memory.
         """
+        now = time.monotonic()
         registered_gpu_ids: list[int] = []
         cache_context_meta: dict[str, dict] = {}
+        links: dict[str, dict] = {}
 
-        for instance_id, entry in self.context_entries_snapshot().items():
+        with self._lock:
+            entries = dict(self._cache_contexts)
+            registering_ids = sorted(self._registering_instance_counts)
+            inflight_count = self._register_kv_cache_inflight
+
+        for instance_id, entry in entries.items():
             registered_gpu_ids.append(instance_id)
             ctx = entry.cache_context
             cache_context_meta[str(instance_id)] = {
@@ -937,10 +974,72 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 "world_size": entry.world_size,
                 "kv_cache_layout": ctx.report_status(),
             }
+            ping_timeout = (
+                self._worker_reap_timeout_seconds
+                if entry.has_liveness_signal
+                else self._worker_registration_grace_seconds
+            )
+            ping_age = None if entry.last_ping is None else now - entry.last_ping
+            if entry.has_liveness_signal:
+                state = (
+                    "stale"
+                    if ping_age is not None
+                    and ping_timeout > 0
+                    and ping_age > ping_timeout
+                    else "healthy"
+                )
+            else:
+                state = (
+                    "stale"
+                    if ping_timeout > 0 and now - entry.last_seen > ping_timeout
+                    else "awaiting_first_ping"
+                )
+            links[str(instance_id)] = {
+                "state": state,
+                "registered": True,
+                "register_kv_cache_in_progress": instance_id in registering_ids,
+                "ping_received": entry.has_liveness_signal,
+                "last_ping_age_seconds": ping_age,
+                "ping_timeout_seconds": ping_timeout,
+            }
+
+        for instance_id in registering_ids:
+            links.setdefault(
+                str(instance_id),
+                {
+                    "state": "registering",
+                    "registered": False,
+                    "register_kv_cache_in_progress": True,
+                    "ping_received": False,
+                    "last_ping_age_seconds": None,
+                    "ping_timeout_seconds": None,
+                },
+            )
+
+        registered_gpu_ids.sort()
+        state_counts = {
+            state: sum(link["state"] == state for link in links.values())
+            for state in ("healthy", "registering", "awaiting_first_ping", "stale")
+        }
 
         return {
             "registered_gpu_ids": registered_gpu_ids,
+            "registered_gpu_count": len(registered_gpu_ids),
             "cache_context_meta": cache_context_meta,
+            "mp_links": {
+                "registered_gpu_ids": registered_gpu_ids,
+                "registered_gpu_count": len(registered_gpu_ids),
+                "register_kv_cache": {
+                    "in_progress": inflight_count > 0,
+                    "inflight_count": inflight_count,
+                    "instance_ids": registering_ids,
+                },
+                "links": links,
+                "healthy_count": state_counts["healthy"],
+                "registering_count": state_counts["registering"],
+                "awaiting_first_ping_count": state_counts["awaiting_first_ping"],
+                "stale_count": state_counts["stale"],
+            },
         }
 
     def close(self) -> None:
