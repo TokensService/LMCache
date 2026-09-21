@@ -19,7 +19,7 @@ from lmcache.integration.request_telemetry.factory import RequestTelemetryFactor
 from lmcache.integration.vllm.experimental import dispatch
 from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
-from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
+from lmcache.v1.mp_observability.errors import LMCacheRequestExpiredError
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
@@ -1639,10 +1639,13 @@ class LMCacheMPWorkerAdapter:
 
             try:
                 s_result = s_future.result(timeout=60)
-            except LMCacheTimeoutError:
+            except LMCacheRequestExpiredError:
                 # The MQ client's TTL sweep expired the request: the server
                 # never responded. Treat it as a failed store; the KV is
                 # simply not cached and the engine recomputes on a miss.
+                # query() is already True here, so the 60s wait cannot
+                # itself time out; the sweep's expiry is the only reachable
+                # failure and is caught precisely by type.
                 s_result = None
             finished_stores.add(request_id)
 
@@ -1659,7 +1662,7 @@ class LMCacheMPWorkerAdapter:
 
             try:
                 r_result = r_future.result(timeout=60)
-            except LMCacheTimeoutError:
+            except LMCacheRequestExpiredError:
                 # TTL sweep expiry: no response ever arrived, so the KV was
                 # never loaded into the target blocks.
                 r_result = None
