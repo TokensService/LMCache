@@ -12,8 +12,9 @@ BUILD_WITH_MOONCAKE="${BUILD_WITH_MOONCAKE:-0}"
 BUILD_WITH_AEROSPIKE="${BUILD_WITH_AEROSPIKE:-0}"
 BUILD_RUST="${BUILD_RUST:-0}"
 INSTALL_DEPS="${INSTALL_DEPS:-1}"
-HTTP_PROXY="${HTTP_PROXY-${http_proxy-http://192.168.10.6:3128}}"
+HTTP_PROXY="${HTTP_PROXY-${http_proxy-}}"
 HTTPS_PROXY="${HTTPS_PROXY-${https_proxy-$HTTP_PROXY}}"
+DEPENDENCY_PROXY_FALLBACK="${DEPENDENCY_PROXY_FALLBACK-http://127.0.0.1:8118}"
 PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 
 usage() {
@@ -27,7 +28,9 @@ BUILD_JOBS             编译并行度，默认 nproc / 2，最低 1
 TORCH_CUDA_ARCH_LIST   默认 10.0（BNT3 场景）；其他 GPU 请指定目标架构
 CUDA_HOME              不指定时，优先匹配 Torch 的 CUDA 主次版本
 INSTALL_DEPS           1 自动补齐构建依赖；0 仅检查
-HTTP_PROXY/HTTPS_PROXY 依赖代理；失败依次尝试本地 8118、直连
+WHEEL_VERSION          可选的 PEP 440 版本；设置后固定 wheel 版本名
+HTTP_PROXY/HTTPS_PROXY 首选依赖代理；未设置时不绑定环境专用代理
+DEPENDENCY_PROXY_FALLBACK  回退代理，默认本地 8118；设为空可禁用
 PIP_INDEX_URL          Python 源（未设置时使用清华源）
 BUILD_WITH_MOONCAKE    默认 0；1 需要 MOONCAKE_INCLUDE_DIR、MOONCAKE_LIB_DIR
 BUILD_WITH_AEROSPIKE   默认 0；1 需要 AEROSPIKE_INCLUDE_DIR、AEROSPIKE_LIBRARY_DIR
@@ -59,12 +62,28 @@ source_metadata() {
 
 # setuptools-scm 在元数据阶段也会调用 git。无 git 的 CI 镜像需传入 PEP 440 版本。
 configure_setuptools_scm() {
+  local version="${WHEEL_VERSION:-}"
+  if [[ -n "$version" ]]; then
+    [[ "$version" =~ ^v[0-9] ]] && version="${version#v}"
+    if ! "$PYTHON" - "$version" <<'PY' >/dev/null 2>&1
+from packaging.version import Version
+import sys
+Version(sys.argv[1])
+PY
+    then
+      die "WHEEL_VERSION 不是有效的 PEP 440 版本：$WHEEL_VERSION"
+    fi
+    export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE="$version"
+    log "使用指定的 wheel 版本：$SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE"
+    return
+  fi
+
   [[ -n "${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE:-}" ]] && return
   if command -v git >/dev/null && git -C "$REPO_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
     return
   fi
 
-  local version="${RELEASE_TAG:-${RELEASE_NAME:-}}"
+  version="${RELEASE_TAG:-${RELEASE_NAME:-}}"
   [[ "$version" =~ ^v[0-9] ]] && version="${version#v}"
   if ! "$PYTHON" - "$version" <<'PY' >/dev/null 2>&1
 from packaging.version import Version
@@ -198,8 +217,8 @@ with_proxy() {
   fi
 }
 install_python_deps() {
-  local proxy
-  for proxy in "$HTTP_PROXY" http://127.0.0.1:8118 ''; do
+  local proxy primary_proxy="${HTTP_PROXY:-$HTTPS_PROXY}"
+  for proxy in "$primary_proxy" "$DEPENDENCY_PROXY_FALLBACK" ''; do
     if with_proxy "$proxy" "$PYTHON" -m pip install --disable-pip-version-check --timeout 15 --retries 1 \
       --index-url "$PIP_INDEX_URL" "$@"; then return; fi
   done
@@ -212,7 +231,8 @@ if (( ${#missing[@]} )); then
   [[ "$INSTALL_DEPS" == 1 ]] || die "缺少系统依赖：${missing[*]}"
   [[ $(id -u) == 0 ]] && command -v apt-get >/dev/null || die '自动补齐系统依赖需要 root 和 apt-get'
   apt_ok=0
-  for proxy in "$HTTP_PROXY" http://127.0.0.1:8118 ''; do
+  primary_proxy="${HTTP_PROXY:-$HTTPS_PROXY}"
+  for proxy in "$primary_proxy" "$DEPENDENCY_PROXY_FALLBACK" ''; do
     if with_proxy "$proxy" apt-get -o "Acquire::http::Proxy=${proxy:-DIRECT}" -o "Acquire::https::Proxy=${proxy:-DIRECT}" -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o APT::Update::Error-Mode=any update &&
       with_proxy "$proxy" env DEBIAN_FRONTEND=noninteractive apt-get -o "Acquire::http::Proxy=${proxy:-DIRECT}" -o "Acquire::https::Proxy=${proxy:-DIRECT}" -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y --no-install-recommends "${missing[@]}"; then apt_ok=1; break; fi
   done
@@ -306,6 +326,7 @@ cat > "$stage/BUILD-INFO" <<EOF
 SOURCE_COMMIT=$SOURCE_COMMIT
 SOURCE_DESCRIBE=$SOURCE_DESCRIBE
 SOURCE_DIRTY=$SOURCE_DIRTY
+WHEEL_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE:-scm-derived}
 PYTHON=$PYTHON_VERSION
 TORCH=$TORCH_VERSION
 CUDA=$NVCC_VERSION

@@ -27,6 +27,12 @@ class BuildWheelTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn("BUILD_WITH_MOONCAKE", result.stdout)
+        self.assertIn("WHEEL_VERSION", result.stdout)
+        self.assertIn("DEPENDENCY_PROXY_FALLBACK", result.stdout)
+
+    def test_builder_has_no_environment_specific_proxy(self) -> None:
+        """构建脚本不能默认绑定特定环境的内网代理。"""
+        self.assertNotIn("192.168.10.6:3128", SOURCE)
 
     def test_invalid_flag(self) -> None:
         """不允许拼错的开关静默改变构建内容。"""
