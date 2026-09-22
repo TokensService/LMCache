@@ -156,7 +156,14 @@ class LMCacheMPConnector:
         self._pending_lookups_lock = threading.Lock()
 
         self.context = zmq.Context.instance()
-        self.mq_client = MessageQueueClient(f"tcp://{host}:{port}", self.context)
+        # TTL strictly greater than the longest synchronous wait
+        # (WAIT_LOOKUP_RESULT blocks for mq_timeout + buffer) so the MQ
+        # client's expiry sweep never preempts a caller's own result(timeout).
+        self.mq_client = MessageQueueClient(
+            f"tcp://{host}:{port}",
+            self.context,
+            request_ttl_s=(self._mq_timeout + _WAIT_LOOKUP_RESPONSE_BUFFER_S + 60.0),
+        )
 
         self._lmcache_chunk_size = get_lmcache_chunk_size(self.mq_client)
         if self._lmcache_chunk_size % self.page_size != 0:

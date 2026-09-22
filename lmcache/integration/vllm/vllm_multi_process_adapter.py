@@ -19,6 +19,7 @@ from lmcache.integration.request_telemetry.factory import RequestTelemetryFactor
 from lmcache.integration.vllm.experimental import dispatch
 from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
+from lmcache.v1.mp_observability.errors import LMCacheRequestExpiredError
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
@@ -568,14 +569,17 @@ class LMCacheMPSchedulerAdapter:
         )
         assert len(server_urls) >= 1, "At least one server url required"
         self._server_urls: list[str] = list(server_urls)
-        self.mq_clients: dict[str, MessageQueueClient] = {
-            url: MessageQueueClient(url, context) for url in self._server_urls
-        }
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
         self._mq_timeout = mq_timeout
+        self.mq_clients: dict[str, MessageQueueClient] = {
+            # TTL strictly greater than the synchronous RPC timeout so the
+            # sweep never races a caller's own result(timeout=...).
+            url: MessageQueueClient(url, context, request_ttl_s=mq_timeout + 60.0)
+            for url in self._server_urls
+        }
 
         # Lookup state tracking:
         # - _pending_lookups: request_ids submitted but not yet resolved
@@ -1066,7 +1070,13 @@ class LMCacheMPWorkerAdapter:
                 self._mp_transfer_mode = None
         else:
             self._mp_transfer_mode = None
-        self.mq_client = MessageQueueClient(server_url, context)
+        self.mq_client = MessageQueueClient(
+            # TTL strictly greater than the synchronous RPC timeout so the
+            # sweep never races a caller's own result(timeout=...).
+            server_url,
+            context,
+            request_ttl_s=mq_timeout + 60.0,
+        )
         self._mq_timeout = mq_timeout
 
         # Instance id for GPU worker. uuid4-derived (OS entropy) rather
@@ -1627,7 +1637,16 @@ class LMCacheMPWorkerAdapter:
             if not s_future.query():
                 continue
 
-            s_result = s_future.result(timeout=60)
+            try:
+                s_result = s_future.result(timeout=60)
+            except LMCacheRequestExpiredError:
+                # The MQ client's TTL sweep expired the request: the server
+                # never responded. Treat it as a failed store; the KV is
+                # simply not cached and the engine recomputes on a miss.
+                # query() is already True here, so the 60s wait cannot
+                # itself time out; the sweep's expiry is the only reachable
+                # failure and is caught precisely by type.
+                s_result = None
             finished_stores.add(request_id)
 
             if not s_result:
@@ -1637,11 +1656,16 @@ class LMCacheMPWorkerAdapter:
                     request_id,
                 )
 
-        for request_id, (r_future, _) in self.retrieve_futures.items():
+        for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
             if not r_future.query():
                 continue
 
-            r_result = r_future.result(timeout=60)
+            try:
+                r_result = r_future.result(timeout=60)
+            except LMCacheRequestExpiredError:
+                # TTL sweep expiry: no response ever arrived, so the KV was
+                # never loaded into the target blocks.
+                r_result = None
             finished_retrieves.add(request_id)
 
             if not r_result:
@@ -1651,6 +1675,12 @@ class LMCacheMPWorkerAdapter:
                     request_id,
                     r_result,
                 )
+                # Contract: a failed async load must surface its blocks via
+                # get_block_ids_with_load_errors() no later than the same
+                # get_finished() round that reports the request finished,
+                # so vLLM recomputes them instead of reading uninitialized
+                # or stale KV data.
+                self.error_block_ids.update(r_block_ids)
 
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:

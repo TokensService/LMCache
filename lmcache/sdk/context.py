@@ -84,8 +84,12 @@ class LMCacheSDKContext:
         """
         self._kind = kind
         self._zmq_context = zmq.Context()
-        self._mq_client = MessageQueueClient(url, self._zmq_context)
         self._mq_timeout = timeout
+        # TTL strictly greater than the synchronous RPC timeout so the MQ
+        # client's expiry sweep never preempts a caller's own result(timeout).
+        self._mq_client = MessageQueueClient(
+            url, self._zmq_context, request_ttl_s=timeout + 60.0
+        )
         self._model_name = kind.server_model_name(model_name)
         self.instance_id = uuid.uuid4().int & ((1 << 63) - 1)
         self._http_url = http_url
