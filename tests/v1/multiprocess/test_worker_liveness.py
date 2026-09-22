@@ -41,6 +41,10 @@ def _bare_gpu_module() -> LMCacheDrivenTransferModule:
     module._ctx = MagicMock(name="ctx")
     module._cache_contexts = {}
     module._lock = threading.Lock()
+    module._register_kv_cache_inflight = 0
+    module._registering_instance_counts = {}
+    module._worker_reap_timeout_seconds = 120.0
+    module._worker_registration_grace_seconds = 3600.0
     return module
 
 
@@ -120,6 +124,91 @@ def test_gpu_touch_latches_get_does_not() -> None:
     module.touch_instance(1)
     assert module._cache_contexts[1].has_liveness_signal is True
     module.touch_instance(999)  # absent -> no error
+
+
+def test_gpu_status_reports_ping_proven_link_and_registration_stage() -> None:
+    """report_status exposes real MP PING state without probing workers."""
+    module = _bare_gpu_module()
+    now = time.monotonic()
+    module._cache_contexts[1] = ContextEntry(
+        MagicMock(), "model", 1, last_seen=now, has_liveness_signal=True
+    )
+    module.touch_instance(1)
+    module._register_kv_cache_inflight = 1
+    module._registering_instance_counts = {2: 1}
+
+    status = module.report_status()
+
+    assert status["registered_gpu_ids"] == [1]
+    assert status["registered_gpu_count"] == 1
+    links = status["mp_links"]
+    assert links["register_kv_cache"] == {
+        "in_progress": True,
+        "inflight_count": 1,
+        "instance_ids": [2],
+    }
+    assert links["links"]["1"]["state"] == "healthy"
+    assert links["links"]["1"]["ping_received"] is True
+    assert links["links"]["1"]["last_ping_age_seconds"] < 1.0
+    assert links["links"]["2"] == {
+        "state": "registering",
+        "registered": False,
+        "register_kv_cache_in_progress": True,
+        "ping_received": False,
+        "last_ping_age_seconds": None,
+        "ping_timeout_seconds": None,
+    }
+    assert links["healthy_count"] == 1
+    assert links["registering_count"] == 1
+    assert links["awaiting_first_ping_count"] == 0
+    assert links["stale_count"] == 0
+
+
+def test_gpu_status_marks_registered_unpinged_and_expired_links() -> None:
+    """report_status distinguishes pre-PING registration from a stale PING."""
+    module = _bare_gpu_module()
+    now = time.monotonic()
+    module._cache_contexts[1] = ContextEntry(
+        MagicMock(), "model", 1, last_seen=now, has_liveness_signal=False
+    )
+    module._cache_contexts[2] = ContextEntry(
+        MagicMock(),
+        "model",
+        1,
+        last_seen=now,
+        has_liveness_signal=True,
+        last_ping=now - 121.0,
+    )
+
+    links = module.report_status()["mp_links"]
+
+    assert links["links"]["1"]["state"] == "awaiting_first_ping"
+    assert links["links"]["1"]["ping_received"] is False
+    assert links["links"]["1"]["ping_timeout_seconds"] == 3600.0
+    assert links["links"]["2"]["state"] == "stale"
+    assert links["links"]["2"]["ping_received"] is True
+    assert links["links"]["2"]["ping_timeout_seconds"] == 120.0
+    assert links["awaiting_first_ping_count"] == 1
+    assert links["stale_count"] == 1
+
+
+def test_gpu_status_marks_never_pinged_expired_registration_stale() -> None:
+    """report_status expires an unproven link using registration grace."""
+    module = _bare_gpu_module()
+    now = time.monotonic()
+    module._cache_contexts[1] = ContextEntry(
+        MagicMock(),
+        "model",
+        1,
+        last_seen=now - 3601.0,
+        has_liveness_signal=False,
+    )
+
+    links = module.report_status()["mp_links"]
+
+    assert links["links"]["1"]["state"] == "stale"
+    assert links["links"]["1"]["ping_timeout_seconds"] == 3600.0
+    assert links["stale_count"] == 1
 
 
 def test_gpu_reap_two_tier_windows() -> None:

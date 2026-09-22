@@ -1518,13 +1518,3 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "[KVConnector] Cleaned up request_tracker for request %s",
                 request_id,
             )
-        # Also drop any lookup state in the scheduler adapter. Requests that
-        # abort before their first successful block allocation never go
-        # through update_state_after_alloc (the only other cleanup point), so
-        # without this the adapter's per-request lookup dicts -- including
-        # _lookup_params, which holds a full prompt token_ids copy -- would
-        # leak one entry per aborted request. cleanup_lookup_result is
-        # idempotent, so this is a no-op on the normal path.
-        scheduler_adapter = getattr(self, "scheduler_adapter", None)
-        if scheduler_adapter is not None:
-            scheduler_adapter.cleanup_lookup_result(request_id)

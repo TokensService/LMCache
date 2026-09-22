@@ -221,8 +221,9 @@ def test_store_q_block_id_underflow_fails_closed(stub_device) -> None:
 
 
 class _FakeLMCacheDriven:
-    def __init__(self, ctx) -> None:
+    def __init__(self, ctx, **kwargs) -> None:
         self.ctx = ctx
+        self.kwargs = kwargs
 
 
 class _FakeEngineDriven:
@@ -287,6 +288,9 @@ def test_server_builds_q_store_module(stub_server_modules) -> None:
     kwargs = stub_server_modules.call_args.kwargs
     assert kwargs["experimental_transfer"] == [TRANSFER_QUERY]
     assert any(isinstance(t, _FakeQStore) for t in kwargs["liveness_targets"])
+    transfer = next(m for m in modules if isinstance(m, _FakeLMCacheDriven))
+    assert transfer.kwargs["worker_reap_timeout_seconds"] == 120.0
+    assert transfer.kwargs["worker_registration_grace_seconds"] == 3600.0
 
 
 def test_server_builds_nothing_when_no_feature_is_enabled(

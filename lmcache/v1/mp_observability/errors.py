@@ -64,17 +64,3 @@ class LMCacheTimeoutError(TimeoutError):
             )
         except Exception:
             logger.debug("Failed to publish TIMEOUT_RAISED event", exc_info=True)
-
-
-class LMCacheRequestExpiredError(LMCacheTimeoutError):
-    """An MQ request expired in the client's TTL sweep without any response.
-
-    Distinct from a caller-side ``result(timeout=...)`` timeout: this error is
-    attached to a :class:`~lmcache.v1.multiprocess.futures.MessagingFuture` by
-    the shared polling loop when the server never replied within the client's
-    ``request_ttl_s``. Subclasses :class:`LMCacheTimeoutError` (and therefore
-    the builtin ``TimeoutError``), so existing timeout handlers still catch it,
-    while callers that need to tell transport expiry from protocol semantics
-    (e.g. a legitimately ``None`` "still pending" response) can match on this
-    type explicitly.
-    """

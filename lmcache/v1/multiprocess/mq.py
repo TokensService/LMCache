@@ -8,7 +8,6 @@ import inspect
 import itertools
 import queue
 import threading
-import time
 
 # Third Party
 import msgspec
@@ -17,7 +16,6 @@ import zmq
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
-from lmcache.v1.mp_observability.errors import LMCacheRequestExpiredError
 from lmcache.v1.multiprocess.affinity_pool import AffinityThreadPool
 from lmcache.v1.multiprocess.custom_types import (
     DeviceIPCWrapper,
@@ -41,19 +39,6 @@ T = TypeVar("T")
 
 # Internal type used for the client-server communication
 RequestUID = int
-
-# Default time-to-live (seconds) for an outbound request awaiting a response.
-# A pending future older than this is failed with LMCacheRequestExpiredError
-# (a TimeoutError subclass) so that client-side per-request state cannot
-# accumulate without bound when the server never replies (e.g. a handler
-# raised and no response was sent).
-# Deliberately larger than the default synchronous RPC timeout (300s) so the
-# sweep never preempts a caller's own ``result(timeout=...)``; integrations
-# pass an explicit TTL derived from their configured timeout.
-DEFAULT_REQUEST_TTL_S = 600.0
-
-# Minimum interval (seconds) between two TTL sweeps of the same client.
-_SWEEP_INTERVAL_S = 5.0
 
 
 # Helper functions
@@ -270,12 +255,6 @@ class ClientPollingLoop:
                     if owner is not None:
                         owner.process_inbound()
 
-            # TTL sweep: fail futures whose responses never arrived so
-            # client-side per-request state cannot accumulate unboundedly.
-            # Each client throttles internally (see sweep_expired).
-            for client in list(self._socket_to_client.values()):
-                client.sweep_expired()
-
         # Drain remaining ops so any waiting threads unblock.
         self._process_ops()
 
@@ -289,12 +268,7 @@ class MessageQueueClient:
         request_type: RequestType
         request_payloads: list[Any]
 
-    def __init__(
-        self,
-        server_url: str,
-        context: zmq.Context,
-        request_ttl_s: float = DEFAULT_REQUEST_TTL_S,
-    ):
+    def __init__(self, server_url: str, context: zmq.Context):
         # Socket
         self.ctx = context
         self.socket = self.ctx.socket(zmq.DEALER)
@@ -306,13 +280,6 @@ class MessageQueueClient:
         # Pending job's futures
         self._request_counter = itertools.count()
         self.pending_futures: dict[int, MessagingFuture[Any]] = {}
-
-        # TTL bookkeeping for pending futures. Both dicts are accessed only
-        # from the shared polling-loop thread (see process_inbound docstring).
-        # request_ttl_s <= 0 disables sweeping.
-        self._request_ttl_s = request_ttl_s
-        self.pending_since: dict[int, float] = {}
-        self._last_sweep = time.monotonic() - _SWEEP_INTERVAL_S
 
         # Register with the shared polling loop
         self._polling_loop = ClientPollingLoop.get_instance()
@@ -326,7 +293,6 @@ class MessageQueueClient:
                 # Update the pending futures
                 request_uid = wrapped_request.request_uid
                 self.pending_futures[request_uid] = wrapped_request.future
-                self.pending_since[request_uid] = time.monotonic()
 
                 # Send the request
                 b_request_uid = msgspec_encode(request_uid, cls=RequestUID)
@@ -384,54 +350,11 @@ class MessageQueueClient:
 
         if request_uid in self.pending_futures:
             future = self.pending_futures.pop(request_uid)
-            self.pending_since.pop(request_uid, None)
             if b_response:
                 response = msgspec_decode(b_response[0], cls=response_cls)
                 future.set_result(response)
             else:
                 future.set_result(None)
-
-    def sweep_expired(self) -> None:
-        """Fail pending futures whose response has not arrived within the TTL.
-
-        Called periodically by the shared :class:`ClientPollingLoop` thread
-        (the sole accessor of ``pending_futures``/``pending_since``). An
-        expired future is failed with :class:`LMCacheRequestExpiredError`
-        (a ``TimeoutError`` subclass) via ``set_exception``, keeping transport
-        expiry distinguishable from a legitimate ``None``/empty protocol
-        response. This bounds the lifetime of client-side per-request state
-        when the server never replies (for example, when a blocking handler
-        raised and no response frame was sent).
-
-        A no-op when ``request_ttl_s <= 0`` (sweeping disabled). Sweeps are
-        throttled to at most one per ``_SWEEP_INTERVAL_S`` seconds.
-        """
-        if self._request_ttl_s <= 0:
-            return
-        now = time.monotonic()
-        if now - self._last_sweep < _SWEEP_INTERVAL_S:
-            return
-        self._last_sweep = now
-        expired = [
-            uid
-            for uid, ts in self.pending_since.items()
-            if now - ts > self._request_ttl_s
-        ]
-        for uid in expired:
-            self.pending_since.pop(uid, None)
-            future = self.pending_futures.pop(uid, None)
-            if future is not None:
-                logger.warning(
-                    "MQ request uid=%s expired after %.1fs without a response",
-                    uid,
-                    self._request_ttl_s,
-                )
-                future.set_exception(
-                    LMCacheRequestExpiredError(
-                        f"MQ request uid={uid} expired after "
-                        f"{self._request_ttl_s}s without a response"
-                    )
-                )
 
     def submit_request(
         self,
