@@ -57,12 +57,28 @@ class LayoutDescRegistry:
     for prefetch tasks. Multiple worker instances can share the same
     ``(model_name, world_size)`` entry, so the registry keeps the descriptor
     until the last matching registration is unregistered.
+
+    When pipeline parallelism (PP > 1) is used, different PP ranks handle
+    different numbers of layers. All ranks share the same
+    ``(model_name, world_size)`` pair, but their layouts differ. To support
+    this, the registry also stores per-instance layouts keyed by
+    ``instance_id``. When multiple instances with distinct layouts are
+    registered, ``find_group_layout_descs`` returns a dict with composite
+    keys ``(object_group_id, global_rank)`` so the prefetch controller can
+    allocate the correct buffer size for each rank.
     """
 
     def __init__(self) -> None:
         # Key: (model_name, world_size) -> layout descriptor entry
         self._registry: dict[tuple[str, int], _LayoutDescEntry] = {}
         self._lock = threading.Lock()
+        # Per-instance layouts: instance_id -> (group_layout_descs, global_rank)
+        self._instance_layouts: dict[
+            int, tuple[dict[int, MemoryLayoutDesc], int]
+        ] = {}
+        # Registration order: list of (instance_id, global_rank) for
+        # determining rank assignment.
+        self._instance_order: list[tuple[int, int]] = []
 
     def register(
         self,
@@ -71,11 +87,16 @@ class LayoutDescRegistry:
         layout_desc: MemoryLayoutDesc,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         group_layout_descs: dict[int, MemoryLayoutDesc] | None = None,
+        instance_id: int | None = None,
     ) -> None:
         """Register a layout descriptor for a (model_name, world_size) pair.
 
         Re-registering the same pair increments the active registration
         count. The latest descriptor is retained for lookups.
+
+        When ``instance_id`` is provided, the per-instance layout is also
+        stored so that pipeline-parallel ranks with different layer counts
+        can coexist without overwriting each other.
 
         Args:
             model_name: The model name.
@@ -87,6 +108,8 @@ class LayoutDescRegistry:
                 (each group is a separate keyed allocation); ``None`` derives
                 one entry per object group in ``attn_desc``, all sharing
                 ``layout_desc``.
+            instance_id: Optional GPU instance ID for per-instance layout
+                tracking (needed for pipeline parallelism).
         """
         key = (model_name, world_size)
         attn_desc = replace(attn_desc, world_size=world_size)
@@ -103,14 +126,27 @@ class LayoutDescRegistry:
                     attn_desc=attn_desc,
                     group_layout_descs=group_layout_descs,
                 )
-                return
+            else:
+                entry.layout_desc = layout_desc
+                entry.attn_desc = attn_desc
+                entry.group_layout_descs = group_layout_descs
+                entry.ref_count += 1
 
-            entry.layout_desc = layout_desc
-            entry.attn_desc = attn_desc
-            entry.group_layout_descs = group_layout_descs
-            entry.ref_count += 1
+            # Store per-instance layout for PP support
+            if instance_id is not None:
+                global_rank = len(self._instance_order)
+                self._instance_layouts[instance_id] = (
+                    dict(group_layout_descs),
+                    global_rank,
+                )
+                self._instance_order.append((instance_id, global_rank))
 
-    def unregister(self, model_name: str, world_size: int) -> None:
+    def unregister(
+        self,
+        model_name: str,
+        world_size: int,
+        instance_id: int | None = None,
+    ) -> None:
         """Unregister one layout descriptor registration for a pair.
 
         The descriptor is removed only when the last active registration for
@@ -119,6 +155,8 @@ class LayoutDescRegistry:
         Args:
             model_name: The model name.
             world_size: The world size.
+            instance_id: Optional GPU instance ID to clean up per-instance
+                layout tracking.
         """
         key = (model_name, world_size)
         with self._lock:
@@ -128,9 +166,16 @@ class LayoutDescRegistry:
 
             if entry.ref_count <= 1:
                 self._registry.pop(key)
-                return
+            else:
+                entry.ref_count -= 1
 
-            entry.ref_count -= 1
+            if instance_id is not None:
+                self._instance_layouts.pop(instance_id, None)
+                self._instance_order = [
+                    (iid, rank)
+                    for iid, rank in self._instance_order
+                    if iid != instance_id
+                ]
 
     def find(self, model_name: str, world_size: int) -> MemoryLayoutDesc | None:
         """Look up a layout descriptor by (model_name, world_size).
@@ -150,13 +195,63 @@ class LayoutDescRegistry:
 
     def find_group_layout_descs(
         self, model_name: str, world_size: int
-    ) -> dict[int, MemoryLayoutDesc] | None:
-        """Look up per-object-group layout descriptors, or ``None``."""
+    ) -> dict[int, MemoryLayoutDesc] | dict[tuple[int, int], MemoryLayoutDesc] | None:
+        """Look up per-object-group layout descriptors, or ``None``.
+
+        When multiple GPU instances with distinct layouts are registered
+        (e.g. pipeline parallelism with different layer counts per rank),
+        returns a dict with composite keys
+        ``(object_group_id, global_rank)`` so callers can match each key's
+        ``kv_rank.global_rank`` to the correct layout.
+        """
         with self._lock:
             entry = self._registry.get((model_name, world_size))
             if entry is None:
                 return None
+
+            # Check if per-instance layouts exist with different sizes
+            if self._instance_layouts:
+                unique_layouts: list[
+                    tuple[dict[int, MemoryLayoutDesc], int]
+                ] = []
+                seen_sizes: set[int] = set()
+                for instance_id, (glds, global_rank) in (
+                    self._instance_layouts.items()
+                ):
+                    # Compute a signature for this layout
+                    sig = self._layout_signature(glds)
+                    if sig not in seen_sizes:
+                        seen_sizes.add(sig)
+                        unique_layouts.append((glds, global_rank))
+
+                if len(unique_layouts) > 1:
+                    # Multiple distinct layouts: return composite-keyed dict
+                    merged: dict[tuple[int, int], MemoryLayoutDesc] = {}
+                    for glds, global_rank in unique_layouts:
+                        for gid, gld in glds.items():
+                            merged[(gid, global_rank)] = gld
+                    return merged
+
             return entry.group_layout_descs
+
+    @staticmethod
+    def _layout_signature(
+        group_layout_descs: dict[int, MemoryLayoutDesc],
+    ) -> int:
+        """Compute a stable signature for a group of layouts.
+
+        Two layouts with the same shapes/dtypes produce the same signature,
+        allowing us to detect when all instances share one layout (PP=1)
+        vs. when they differ (PP>1 with different layer counts).
+        """
+        total = 0
+        for gld in group_layout_descs.values():
+            for shape, dtype in zip(gld.shapes, gld.dtypes):
+                numel = 1
+                for dim in shape:
+                    numel *= int(dim)
+                total += numel * dtype.itemsize
+        return total
 
     def find_attn_desc(self, model_name: str, world_size: int) -> AttnWindowDesc:
         """Look up the attention-window descriptor for a pair.
