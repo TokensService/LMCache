@@ -889,6 +889,7 @@ class ContextEntry:
     last_seen: float = 0.0
     has_liveness_signal: bool = False
     event_backend: EventIPCBackend | None = None
+    instance_id: int | None = None
 
 
 class LMCacheDrivenTransferModule(InstanceLivenessTarget):
@@ -1091,7 +1092,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         for entry in entries:
             entry.cache_context.close()
             self._ctx.layout_desc_registry.unregister(
-                entry.model_name, entry.world_size
+                entry.model_name, entry.world_size,
+                instance_id=entry.instance_id,
             )
         del entry
         entries.clear()
@@ -1210,6 +1212,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             layout_desc,
             attn_desc,
             group_layout_descs=group_layout_descs,
+            instance_id=instance_id,
         )
 
         with self._lock:
@@ -1220,6 +1223,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 last_seen=now,
                 has_liveness_signal=False,
                 event_backend=event_backend,
+                instance_id=instance_id,
             )
 
         logger.info(

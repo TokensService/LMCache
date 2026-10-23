@@ -1068,19 +1068,54 @@ class PrefetchController(StorageControllerInterface):
         retention_map = dict(zip(keys_to_reserve, retentions, strict=True))
 
         # Batch reserve_write by object_group_id so each group uses its own
-        # tensor shapes.
+        # tensor shapes. When pipeline parallelism causes multiple layouts to
+        # coexist, group_layout_descs may use composite keys
+        # (object_group_id, global_rank) — group by both dimensions.
         write_results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
-        by_group = sorted(keys_to_reserve, key=attrgetter("object_group_id"))
-        for gid, group_iter in groupby(by_group, key=attrgetter("object_group_id")):
-            group_keys = list(group_iter)
-            gld = request.group_layout_descs[gid]
-            gr = self._l1_manager.reserve_write(
-                keys=group_keys,
-                is_temporary=[not retention_map[k] for k in group_keys],
-                layout_desc=gld,
-                mode="new",
-            )
-            write_results.update(gr)
+        glds = request.group_layout_descs
+        has_composite_keys = any(isinstance(k, tuple) for k in glds)
+
+        if has_composite_keys:
+            # PP multi-layout path: group keys by (object_group_id, kv_rank)
+            from collections import defaultdict as _dd
+            rank_groups: dict[tuple[int, int], list[ObjectKey]] = _dd(list)
+            for key in keys_to_reserve:
+                grank = (
+                    key.kv_rank.global_rank
+                    if key.kv_rank is not None
+                    else 0
+                )
+                rank_groups[(key.object_group_id, grank)].append(key)
+
+            for (gid, grank), group_keys in rank_groups.items():
+                # Try composite key first, fall back to plain gid
+                gld = glds.get((gid, grank)) or glds.get(gid)
+                if gld is None:
+                    # No layout for this rank: skip (will be reported as
+                    # unreserved below)
+                    continue
+                gr = self._l1_manager.reserve_write(
+                    keys=group_keys,
+                    is_temporary=[not retention_map[k] for k in group_keys],
+                    layout_desc=gld,
+                    mode="new",
+                )
+                write_results.update(gr)
+        else:
+            # Standard path: single layout per object_group_id
+            by_group = sorted(keys_to_reserve, key=attrgetter("object_group_id"))
+            for gid, group_iter in groupby(
+                by_group, key=attrgetter("object_group_id")
+            ):
+                group_keys = list(group_iter)
+                gld = request.group_layout_descs[gid]
+                gr = self._l1_manager.reserve_write(
+                    keys=group_keys,
+                    is_temporary=[not retention_map[k] for k in group_keys],
+                    layout_desc=gld,
+                    mode="new",
+                )
+                write_results.update(gr)
 
         reserved: set[ObjectKey] = set()
         oom_keys: list[ObjectKey] = []
