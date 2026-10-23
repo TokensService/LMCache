@@ -435,7 +435,7 @@ class PrefetchRequestSpec:
     """
 
     keys: list[ObjectKey]
-    group_layout_descs: dict[int, MemoryLayoutDesc]
+    group_layout_descs: dict[int, MemoryLayoutDesc] | dict[tuple[int, int], MemoryLayoutDesc]
     num_kv_readers: int = 1
     policy: TrimPolicy = TrimPolicy.PREFIX
     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
