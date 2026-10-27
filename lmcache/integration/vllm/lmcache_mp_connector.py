@@ -4,6 +4,8 @@
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 import math
+import os
+import re
 import sys
 
 # Third Party
@@ -445,6 +447,49 @@ def _ensure_transport_scheme(server_url: str) -> str:
     return f"tcp://{server_url}"
 
 
+def _parse_bool_flag(raw: Any) -> bool:
+    """Coerce a config value to bool, accepting string spellings.
+
+    ``bool("false")`` would be True, so string values are matched against the
+    usual truthy spellings instead of being passed to ``bool``.
+
+    Args:
+        raw: The raw config value (bool, int, float, or str).
+
+    Returns:
+        True for truthy values (``1/true/yes/on``, case-insensitive).
+    """
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+_LAYER_NAME_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def _layer_index_from_name(layer_name: str) -> int | None:
+    """Extract the local layer index from a vLLM layer name.
+
+    vLLM layer names look like ``layers.0.self_attn`` / ``model.layers.3``;
+    under pipeline parallelism the index is the *local* layer index of the
+    PP stage (the same space the LMCache server uses for its per-layer
+    events). Returns None for names that do not carry a parsable index.
+
+    Args:
+        layer_name: The attention layer name passed to ``wait_for_layer_load``.
+
+    Returns:
+        The local layer index, or None when the name has no ``layers.<n>``
+        segment.
+    """
+    m = _LAYER_NAME_RE.search(str(layer_name))
+    if m is None:
+        return None
+    return int(m.group(1))
+
+
 class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     """
     The connector for LMCache multi-process mode.
@@ -639,6 +684,23 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             raise ValueError(f"Unknown KVConnectorRole: {self.role}")
 
+        # Layerwise load: when enabled, start_load_kv submits the retrieve
+        # request asynchronously and wait_for_layer_load blocks per layer so
+        # that the embedding / early attention layers overlap with the LMCache
+        # server's per-layer H2D copies (sync scheduler mode, see
+        # get_num_new_matched_tokens).
+        #
+        # Controlled by:
+        #   1. kv_transfer_config extra_config key "lmcache.mp.use_layerwise_load"
+        #      (wins when present), or
+        #   2. the LMCACHE_MP_USE_LAYERWISE_LOAD env var (1/true/yes/on).
+        self._use_layerwise_load: bool = self._resolve_layerwise_load_flag(
+            vllm_config.kv_transfer_config
+        )
+        # Call-order fallback counter for layer names that do not carry a
+        # parsable layer index (reset per step in start_load_kv).
+        self._layer_counter = 0
+
         # Tokens covered by one paged chunk (one block ID) of each engine
         # group, from the group's KV cache spec. Hybrid models can mix
         # different values (e.g. gemma-4: sliding-window groups 32,
@@ -670,6 +732,33 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                         f"a multiple of group {engine_group_idx} "
                         f"tokens_per_block {tokens_per_block}"
                     )
+
+    @staticmethod
+    def _resolve_layerwise_load_flag(kv_transfer_config: Any | None) -> bool:
+        """Resolve whether per-layer (layer-wise) KV loading is enabled.
+
+        Priority: the ``lmcache.mp.use_layerwise_load`` extra_config key wins
+        when present; otherwise the ``LMCACHE_MP_USE_LAYERWISE_LOAD`` env var
+        (``1/true/yes/on``) is consulted; the default is off.
+
+        Args:
+            kv_transfer_config: The vLLM ``KVTransferConfig`` carrying
+                ``kv_connector_extra_config`` (may be None).
+
+        Returns:
+            True when per-layer loading is enabled.
+        """
+        if kv_transfer_config is not None:
+            extra_config = getattr(
+                kv_transfer_config, "kv_connector_extra_config", None
+            )
+            if (
+                extra_config is not None
+                and "lmcache.mp.use_layerwise_load" in extra_config
+            ):
+                return _parse_bool_flag(extra_config["lmcache.mp.use_layerwise_load"])
+        env_val = os.environ.get("LMCACHE_MP_USE_LAYERWISE_LOAD", "")
+        return _parse_bool_flag(env_val)
 
     @property
     def role(self) -> KVConnectorRole:
@@ -745,6 +834,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         KV buffer. This is called from the forward context before the
         forward pass to enable async loading during model execution.
 
+        When ``use_layerwise_load`` is enabled, the retrieve requests are
+        submitted here via the per-layer protocol (one device event per local
+        layer) and the actual H2D synchronisation is deferred to
+        ``wait_for_layer_load``, which waits per layer inside forward.  This
+        lets the embedding / early attention layers overlap with the LMCache
+        server's per-layer H2D copies.
+
         Args:
             forward_context (ForwardContext): the forward context.
             **kwargs: additional arguments for the load operation
@@ -781,7 +877,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             event,
             cache_salts=cache_salts,
             request_configs_list=request_configs_list,
+            layerwise=self._use_layerwise_load,
         )
+
+        # Reset the call-order fallback counter used only when a layer name
+        # does not carry a parsable layer index.
+        self._layer_counter = 0
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
@@ -789,12 +890,28 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         paged buffer. This is called from within attention layer to ensure
         async copying from start_load_kv is complete.
 
-        This interface will be useful for layer-by-layer pipelining.
+        In layerwise mode, the LMCache server copies and signals one layer at
+        a time.  We wait (GPU-side, via ``cudaStreamWaitEvent``) on the
+        current forward stream for the ``layer_idx``-th per-layer event of
+        every retrieve submitted by the most recent ``start_load_kv``, so
+        attention for this layer starts as soon as that layer's KV is
+        resident -- without blocking on the later layers.  This is the
+        per-layer pipelining that replaces the old single-event blocking.
 
         Args:
             layer_name: the name of that layer
         """
-        return
+        if not self._use_layerwise_load:
+            return
+
+        layer_idx = _layer_index_from_name(layer_name)
+        if layer_idx is None:
+            # Non-standard layer name (no ``layers.<n>`` segment): fall back
+            # to the call order within this step.
+            layer_idx = self._layer_counter
+            self._layer_counter += 1
+
+        self.worker_adapter.wait_for_layer_load(layer_idx)
 
     def save_kv_layer(
         self,
@@ -1087,6 +1204,26 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         logger.debug(
             "vLLM hit is: %d, Need to load is %d", num_computed_tokens, need_to_load
         )
+
+        if self._use_layerwise_load and need_to_load > 0:
+            # Sync (layer-wise) load: return async=False so the scheduler
+            # admits the request directly to running (has_sync_kv_loads) and
+            # the worker's wait_for_layer_load blocks per layer inside forward.
+            # update_state_after_alloc is never called for sync loads, so the
+            # read locks on the vLLM-computed prefix (which will never be
+            # retrieved) must be freed here instead of leaking until TTL.
+            free_end = tracker.num_vllm_hit_tokens
+            if free_end > 0:
+                self.scheduler_adapter.free_lookup_locks(
+                    token_ids=tracker.get_token_ids(),
+                    start=0,
+                    end=free_end,
+                    request_id=request.request_id,
+                    cache_salt=tracker.cache_salt,
+                    request_configs=tracker.request_configs,
+                )
+            return need_to_load, False
+
         return need_to_load, need_to_load > 0
 
     def on_new_request(self, request: "Request") -> None:

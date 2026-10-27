@@ -152,24 +152,26 @@ class MessagingFuture(Generic[T]):
 
 class DeviceMessagingFuture(MessagingFuture[T]):
     """
-    The future class that wraps both a result and a device IPC event.
+    The future class that wraps both a result and one or more device IPC events.
     The `query`, `wait`, and `result` methods pend on both the original
-    future and the device event, ordered through the platform event backend.
-    The original future should return tuple[bytes, T], where the first
-    element is the serialized device event handle. An empty handle means the
-    remote side submitted no device work, so completion of the original future
-    is also terminal completion of this future.
+    future and the device event(s), ordered through the platform event backend.
+    The original future should return tuple[bytes | list[bytes], T], where the
+    first element is the serialized device event handle (a list of handles for
+    per-layer retrieves). An empty handle means the remote side submitted no
+    device work, so completion of the original future is also terminal
+    completion of this future.
     """
 
     def __init__(
         self,
-        raw_future: MessagingFuture[tuple[bytes, T]],
+        raw_future: MessagingFuture[tuple[bytes | list[bytes], T]],
         device: Any | None = None,
         event_backend: EventIPCBackend | None = None,
     ) -> None:
         super().__init__()
         self.raw_future_ = raw_future
         self.event_: Any | None = None
+        self.events_: list[Any] = []
         self.result_: T | None = None
         self._raw_response_processed = False
         self.device_ = device if device is not None else torch_dev.current_device()
@@ -186,22 +188,104 @@ class DeviceMessagingFuture(MessagingFuture[T]):
             return
 
         event_bytes, result = self.raw_future_.result()
-        event = None
+        events: list[Any] = []
         if event_bytes:
-            event = self._event_backend.import_event(event_bytes, self.device_)
+            if isinstance(event_bytes, (list, tuple)):
+                # Per-layer retrieve: one handle per layer, in layer order.
+                events = [
+                    self._event_backend.import_event(handle, self.device_)
+                    for handle in event_bytes
+                ]
+            else:
+                events = [
+                    self._event_backend.import_event(event_bytes, self.device_)
+                ]
 
         self.result_ = result
-        self.event_ = event
+        self.events_ = events
+        # Backward-compatible view: the first (or only) event. The whole
+        # retrieve completes only when every event in ``events_`` has fired.
+        self.event_ = events[0] if events else None
         self._raw_response_processed = True
+
+    def ensure_resolved(self, timeout: Optional[float] = None) -> None:
+        """Block until the raw response has arrived and events are imported.
+
+        This waits only for the remote handler to *return* (the work is already
+        enqueued on the server stream); it does not synchronize the device, so
+        it is cheap enough to call from ``wait_for_layer_load`` inside forward.
+
+        Args:
+            timeout: Optional timeout for the underlying raw future.
+
+        Raises:
+            LMCacheTimeoutError: If the raw future does not complete in time.
+        """
+        if self._raw_response_processed:
+            return
+        flag = self.raw_future_.wait(timeout)
+        if not flag:
+            raise LMCacheTimeoutError(
+                "DeviceMessagingFuture raw response not available within timeout"
+            )
+        self._on_raw_future_complete()
+
+    def wait_for_layer(
+        self,
+        layer_idx: int,
+        stream: Any | None = None,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Wait (GPU-side) for one layer's device event on ``stream``.
+
+        Used by layer-wise loading: the current forward stream waits for the
+        server's per-layer H2D event so attention for ``layer_idx`` can start
+        as soon as that layer's KV is resident, without blocking on later
+        layers. This is a stream operation (``cudaStreamWaitEvent``), not a
+        CPU block, so it is compatible with CUDA graph capture.
+
+        Args:
+            layer_idx: Local (PP-stage) layer index.
+            stream: Target stream (defaults to the current stream).
+            timeout: Optional timeout for resolving the raw response (the
+                server returns as soon as the copies are enqueued, so a
+                missing response means a protocol/deployment mismatch, e.g.
+                an old server that does not know the layerwise request).
+
+        Returns:
+            True if the wait was issued, False when this future carries no
+            device work for that layer (nothing to wait on).
+
+        Raises:
+            LMCacheTimeoutError: If the raw response does not arrive within
+                ``timeout``.
+            IndexError: If the response carried fewer per-layer events than
+                ``layer_idx`` (protocol/server mismatch).
+        """
+        if not self._raw_response_processed:
+            self.ensure_resolved(timeout)
+        if layer_idx >= len(self.events_):
+            raise IndexError(
+                f"wait_for_layer({layer_idx}) but the retrieve response only "
+                f"carries {len(self.events_)} per-layer events; the server "
+                "reported fewer layers than the worker is waiting on."
+            )
+        evt = self.events_[layer_idx]
+        if evt is None:
+            return False
+        if stream is None:
+            stream = torch_dev.current_stream()
+        self._event_backend.wait_event(evt, stream)
+        return True
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         """
-        Wait for the future to be done, ordered through the device event.
+        Wait for the future to be done, ordered through the device event(s).
 
         Args:
             timeout (Optional[float]): Maximum time to wait for the UNDERLYING
                 RAW FUTURE in seconds. The exact timeout is not guaranteed
-                when waiting on the device event. (NOTE: this could be improved
+                when waiting on the device events. (NOTE: this could be improved
                 with careful threading management)
 
         Returns:
@@ -209,10 +293,13 @@ class DeviceMessagingFuture(MessagingFuture[T]):
 
         Notes:
             This function does not support waiting for a specific time.
+            For per-layer responses, every imported event is synchronized, so
+            completion means the *whole* retrieve finished.
         """
         if self._raw_response_processed:
-            if self.event_ is not None:
-                self._event_backend.synchronize_event(self.event_, self.device_)
+            for evt in self.events_:
+                if evt is not None:
+                    self._event_backend.synchronize_event(evt, self.device_)
             return True
 
         flag = self.raw_future_.wait(timeout)
@@ -221,8 +308,9 @@ class DeviceMessagingFuture(MessagingFuture[T]):
 
         self._on_raw_future_complete()
 
-        if self.event_ is not None:
-            self._event_backend.synchronize_event(self.event_, self.device_)
+        for evt in self.events_:
+            if evt is not None:
+                self._event_backend.synchronize_event(evt, self.device_)
 
         return True
 
@@ -233,7 +321,7 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         Args:
             timeout (Optional[float]): Maximum time to wait for the UNDERLYING
                 RAW FUTURE in seconds. The exact timeout is not guaranteed
-                when waiting on the device event. (NOTE: this could be improved
+                when waiting on the device events. (NOTE: this could be improved
                 with careful threading management)
 
         Returns:
@@ -259,15 +347,23 @@ class DeviceMessagingFuture(MessagingFuture[T]):
             bool: True if the future is done, False otherwise.
         """
         if self._raw_response_processed:
-            if self.event_ is None:
+            if not self.events_:
                 return True
-            return self._event_backend.query_event(self.event_)
+            return all(
+                self._event_backend.query_event(evt)
+                for evt in self.events_
+                if evt is not None
+            )
 
         if self.raw_future_.query():
             self._on_raw_future_complete()
-            if self.event_ is None:
+            if not self.events_:
                 return True
-            return self._event_backend.query_event(self.event_)
+            return all(
+                self._event_backend.query_event(evt)
+                for evt in self.events_
+                if evt is not None
+            )
 
         return False
 

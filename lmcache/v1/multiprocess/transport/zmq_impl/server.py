@@ -174,6 +174,11 @@ def get_zmq_handler_specs(module: EngineModule) -> list[HandlerSpec]:
                 module.retrieve,
                 ThreadPoolType.AFFINITY,
             ),
+            HandlerSpec(
+                RequestType.RETRIEVE_LAYERWISE,
+                module.retrieve_layerwise,
+                ThreadPoolType.AFFINITY,
+            ),
         ]
     if isinstance(module, EngineDrivenTransferModule):
         return [

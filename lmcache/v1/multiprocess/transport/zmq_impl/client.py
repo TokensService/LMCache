@@ -122,6 +122,30 @@ class ZmqMultiprocessClient(RequestClient):
             skip_first_n_tokens,
         )
 
+    def retrieve_layerwise(
+        self,
+        key: Any,
+        instance_id: int,
+        block_ids: list[list[int]],
+        event_ipc_handle: bytes,
+        skip_first_n_tokens: int,
+    ) -> MessagingFuture[Any]:
+        """Retrieve KV-cache blocks, returning one device event per layer.
+
+        The response is ``(list[bytes], bool)``: one event IPC handle per
+        layer (ordered by local layer index) plus the success flag. Only the
+        ``skip_first_n_tokens``/``event_ipc_handle`` semantics match
+        :meth:`retrieve`; the server issues the per-layer copies and events.
+        """
+        return self._call(
+            RequestType.RETRIEVE_LAYERWISE,
+            key,
+            instance_id,
+            block_ids,
+            event_ipc_handle,
+            skip_first_n_tokens,
+        )
+
     def lookup(self, key: Any, tp_size: int) -> MessagingFuture[Any]:
         """Start a prefix lookup."""
         return self._call(RequestType.LOOKUP, key, tp_size)

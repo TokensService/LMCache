@@ -96,6 +96,13 @@ class ExtraConfigDefault(enum.Enum):
     # VMM IPC instead of legacy CUDA IPC handles; see
     # lmcache/v1/platform/cuda/vmm_ipc.py.
     use_vmm_api = False
+    # Per-layer (layer-wise) KV loading in MP mode: the server transfers and
+    # signals one layer at a time and the worker waits per layer inside
+    # forward (sync scheduler mode). Mirrors the
+    # ``LMCACHE_MP_USE_LAYERWISE_LOAD`` env var; the connector also accepts
+    # the extra_config key directly, so this member exists mainly so the key
+    # is resolved/logged by ``_resolve_extra_config``.
+    use_layerwise_load = False
 
 
 # Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
@@ -1276,9 +1283,13 @@ class LMCacheMPWorkerAdapter:
 
         # Request futures
         self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
-        # request_id -> (future, block_ids)
+        # request_id -> (future, block_ids, layerwise)
+        # ``layerwise`` marks sync-mode (per-layer) retrieves: their completion
+        # must never be reported as ``finished_recving`` (the request is
+        # RUNNING while the load happens inside forward, and the scheduler
+        # asserts finished_recving ids are WAITING_FOR_REMOTE_KVS or finished).
         self.retrieve_futures: dict[
-            str, tuple[MessagingFuture[RetrieveResult], list[int]]
+            str, tuple[MessagingFuture[RetrieveResult], list[int], bool]
         ] = {}
         # The IPC handle is not enough by itself; CUDA needs the exporting
         # event object to stay alive until the consumer is done with it.
@@ -1655,6 +1666,7 @@ class LMCacheMPWorkerAdapter:
         event: _IpcEvent | None,
         cache_salt: str = "",
         request_configs: dict[str, Any] | None = None,
+        layerwise: bool = False,
     ) -> None:
         """
         Submit a KV cache retrieve request to LMCache
@@ -1671,6 +1683,10 @@ class LMCacheMPWorkerAdapter:
             cache_salt: Per-user isolation salt.
             request_configs: Optional LMCache request configs to include in
                 the IPC key.
+            layerwise: When True, submit via the per-layer retrieve protocol
+                (one device event per local layer) so ``wait_for_layer_load``
+                can wait per layer inside forward. Completing such a retrieve
+                is never reported as ``finished_recving`` (sync load).
         """
         self._ensure_heartbeat_started()
 
@@ -1702,8 +1718,9 @@ class LMCacheMPWorkerAdapter:
             event,
             self.blocks_in_chunk,
             skip_first_n_tokens=op.skip_first_n_tokens,
+            layerwise=layerwise,
         )
-        self.retrieve_futures[request_id] = (future, op.flat_block_ids)
+        self.retrieve_futures[request_id] = (future, op.flat_block_ids, layerwise)
         if event is not None:
             self.retrieve_events[request_id] = event
 
@@ -1764,6 +1781,7 @@ class LMCacheMPWorkerAdapter:
         event: _IpcEvent | None,
         cache_salts: list[str] | None = None,
         request_configs_list: list[dict[str, Any] | None] | None = None,
+        layerwise: bool = False,
     ):
         """
         Submit a batched retrieve request to LMCache
@@ -1779,6 +1797,8 @@ class LMCacheMPWorkerAdapter:
                 request_ids.
             request_configs_list: Optional LMCache request configs, one per
                 request.
+            layerwise: When True, submit every retrieve via the per-layer
+                protocol (see :meth:`submit_retrieve_request`).
         """
         if cache_salts is None:
             cache_salts = [""] * len(request_ids)
@@ -1803,7 +1823,36 @@ class LMCacheMPWorkerAdapter:
                 event,
                 cache_salt=salt,
                 request_configs=request_configs,
+                layerwise=layerwise,
             )
+
+    def wait_for_layer_load(self, layer_idx: int) -> None:
+        """Wait (GPU-side) for one layer of every in-flight retrieve.
+
+        Called from the connector's ``wait_for_layer_load`` inside forward when
+        per-layer loading is enabled. For each pending retrieve the raw
+        response is resolved first (the server returns as soon as the copies
+        are *enqueued*, so this is cheap), then the current CUDA stream waits
+        on that retrieve's ``layer_idx``-th device event. Attention for
+        ``layer_idx`` can therefore start as soon as the server finished that
+        layer's H2D copy, without blocking on the later layers.
+
+        Args:
+            layer_idx: Local (PP-stage) layer index to wait for.
+
+        Raises:
+            LMCacheTimeoutError: If a retrieve response does not arrive in
+                time (e.g. a server that does not speak the layerwise
+                protocol).
+            IndexError: If the server returned fewer per-layer events than
+                ``layer_idx`` (protocol/deployment mismatch).
+        """
+        for _request_id, (r_future, _r_block_ids, _is_layerwise) in (
+            self.retrieve_futures.items()
+        ):
+            if not _is_layerwise:
+                continue
+            r_future.wait_for_layer(layer_idx, timeout=self._mq_timeout)
 
     def _process_finished_stores(
         self,
@@ -1860,9 +1909,16 @@ class LMCacheMPWorkerAdapter:
             for request_id, (
                 _r_future,
                 r_block_ids,
+                is_layerwise,
             ) in self.retrieve_futures.items():
-                finished_retrieves.add(request_id)
                 self.error_block_ids.update(r_block_ids)
+                if is_layerwise:
+                    # Sync-mode (per-layer) load: never reported as
+                    # finished_recving (the request is RUNNING, and the
+                    # scheduler asserts finished_recving ids are
+                    # WAITING_FOR_REMOTE_KVS or finished).
+                    continue
+                finished_retrieves.add(request_id)
             self.store_futures.clear()
             self.retrieve_futures.clear()
             self.store_events.clear()
@@ -1890,6 +1946,10 @@ class LMCacheMPWorkerAdapter:
 
         finished_stores = set()
         finished_retrieves = set()
+        # Request ids whose futures completed this call and must be removed
+        # from the tracking dicts (superset of ``finished_retrieves``: it also
+        # covers sync-mode layerwise retrieves, which are never reported).
+        completed_retrieves = set()
         for request_id, s_future in self.store_futures.items():
             if not s_future.query():
                 continue
@@ -1904,12 +1964,14 @@ class LMCacheMPWorkerAdapter:
                     request_id,
                 )
 
-        for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
+        for request_id, (r_future, r_block_ids, is_layerwise) in (
+            self.retrieve_futures.items()
+        ):
             if not r_future.query():
                 continue
 
             r_result = r_future.result(timeout=60)
-            finished_retrieves.add(request_id)
+            completed_retrieves.add(request_id)
 
             if not r_result:
                 self.error_block_ids.update(r_block_ids)
@@ -1920,11 +1982,20 @@ class LMCacheMPWorkerAdapter:
                     r_result,
                 )
 
+            if is_layerwise:
+                # Sync-mode (per-layer) load: the KV was consumed inside the
+                # forward via wait_for_layer_load. Reporting it as
+                # finished_recving would trip the scheduler's assertion that
+                # such ids are WAITING_FOR_REMOTE_KVS or already finished.
+                continue
+
+            finished_retrieves.add(request_id)
+
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
             self.store_futures.pop(request_id, None)
             self.store_events.pop(request_id, None)
-        for request_id in finished_retrieves:
+        for request_id in completed_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
 
@@ -1988,9 +2059,14 @@ class LMCacheMPWorkerAdapter:
             for request_id, (
                 _r_future,
                 r_block_ids,
+                is_layerwise,
             ) in self.retrieve_futures.items():
-                finished_retrieves.add(request_id)
                 self.error_block_ids.update(r_block_ids)
+                if is_layerwise:
+                    # Sync-mode (per-layer) load: never reported as
+                    # finished_recving (see get_finished()).
+                    continue
+                finished_retrieves.add(request_id)
             self.store_futures.clear()
             self.retrieve_futures.clear()
             self.store_events.clear()
@@ -2011,6 +2087,7 @@ class LMCacheMPWorkerAdapter:
 
         finished_stores = set()
         finished_retrieves = set()
+        completed_retrieves = set()
         for request_id, s_future in self.store_futures.items():
             if not s_future.query():
                 continue
@@ -2025,12 +2102,14 @@ class LMCacheMPWorkerAdapter:
                     request_id,
                 )
 
-        for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
+        for request_id, (r_future, r_block_ids, is_layerwise) in (
+            self.retrieve_futures.items()
+        ):
             if not r_future.query():
                 continue
 
             r_result = r_future.result(timeout=60)
-            finished_retrieves.add(request_id)
+            completed_retrieves.add(request_id)
 
             if not r_result:
                 self.error_block_ids.update(r_block_ids)
@@ -2041,11 +2120,18 @@ class LMCacheMPWorkerAdapter:
                     r_result,
                 )
 
+            if is_layerwise:
+                # Sync-mode (per-layer) load: never reported as
+                # finished_recving (see get_finished()).
+                continue
+
+            finished_retrieves.add(request_id)
+
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
             self.store_futures.pop(request_id, None)
             self.store_events.pop(request_id, None)
-        for request_id in finished_retrieves:
+        for request_id in completed_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
 

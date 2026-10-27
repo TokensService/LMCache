@@ -595,6 +595,7 @@ class LMCacheDrivenTransferContext(TransferContext):
         event: IPCEvent | None,
         _blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
+        layerwise: bool = False,
     ) -> MessagingFuture:
         """Submit a handle-based retrieve ordered by ``event``.
 
@@ -608,6 +609,12 @@ class LMCacheDrivenTransferContext(TransferContext):
             event: Producer event that orders writes to the engine KV cache.
             _blocks_in_chunk: Engine blocks per chunk (unused by this transport).
             skip_first_n_tokens: Initial tokens the server must not overwrite.
+            layerwise: When True, ask the server to transfer and signal each
+                layer separately (one device event per layer, in local layer
+                order) so the worker can wait per layer inside forward. Uses
+                the ``RETRIEVE_LAYERWISE`` protocol request; the server falls
+                back to duplicating a single completion event when per-layer
+                transfer is not supported for this deployment.
 
         Returns:
             A device-event-aware future for the server response.
@@ -628,6 +635,17 @@ class LMCacheDrivenTransferContext(TransferContext):
         if event is None:
             raise RuntimeError("LMCache-driven transfer requires an IPC event.")
         event_ipc_handle = self._event_backend.export_event(event, self._device)
+        if layerwise:
+            return self._req_client.retrieve_layerwise(
+                key,
+                instance_id,
+                block_ids,
+                event_ipc_handle,
+                skip_first_n_tokens,
+            ).to_device_future(
+                device=self._device,
+                event_backend=self._event_backend,
+            )
         return self._req_client.retrieve(
             key,
             instance_id,

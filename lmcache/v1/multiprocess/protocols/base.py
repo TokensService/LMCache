@@ -91,6 +91,15 @@ class RequestType(enum.Enum):
 
     CB_PROTOCOL_HANDSHAKE = enum.auto()
 
+    # Layer-wise retrieve: same payload as RETRIEVE, but the server returns one
+    # device-event handle per layer (ordered by layer) so the worker can wait on
+    # each layer's H2D completion independently inside forward. Introduced for
+    # PP4/PP2 layer-wise KV loading; the plain RETRIEVE handler is unchanged.
+    # MUST stay appended at the END (after CB_PROTOCOL_HANDSHAKE): the auto
+    # value is then 34 and matches the frozen wire-id table. Inserting it
+    # mid-enum renumbers every later member and breaks wire compatibility.
+    RETRIEVE_LAYERWISE = enum.auto()
+
     # Deprecated aliases.
     CB_REGISTER_ROPE_V3 = CB_REGISTER_ROPE
     CB_UNREGISTER_ROPE_V3 = CB_UNREGISTER_ROPE

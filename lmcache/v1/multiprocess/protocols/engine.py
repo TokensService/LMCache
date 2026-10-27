@@ -36,6 +36,7 @@ REQUEST_NAMES = [
     "STORE_Q",
     "STORE",
     "RETRIEVE",
+    "RETRIEVE_LAYERWISE",
     "LOOKUP",
     "QUERY_PREFETCH_STATUS",
     "WAIT_PREFETCH_STATUS",
@@ -158,6 +159,18 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "RETRIEVE": ProtocolDefinition(
             payload_classes=[KeyType, int, list[list[int]], bytes, int],
             response_class=tuple[bytes, bool],
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Retrieve KV cache blocks, one device event handle per layer.
+        # Same payload as RETRIEVE. The server copies each layer into the paged
+        # buffer in order and records one event per layer; the response is
+        # (list[bytes], bool) - one event handle per layer (local PP-stage layer
+        # count), empty entries for layers with no device work, and the success
+        # flag. Kept as a distinct request type so old servers and old clients
+        # keep the single-handle RETRIEVE contract untouched.
+        "RETRIEVE_LAYERWISE": ProtocolDefinition(
+            payload_classes=[KeyType, int, list[list[int]], bytes, int],
+            response_class=tuple[list[bytes], bool],
             handler_type=HandlerType.BLOCKING,
         ),
         # Submit a prefix lookup; job is tracked server-side by request_id
